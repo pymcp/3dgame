@@ -11,8 +11,10 @@ signal mine_completed(coord: Vector3i, drops: PackedStringArray, dropped_base: b
 @export var player_id: int = 1
 @export var reach_distance: float = 5.0
 
-const HIGHLIGHT_COLOR_DEFAULT: Color = Color(1.0, 0.95, 0.2, 0.85)
-const HIGHLIGHT_COLOR_DAMAGED: Color = Color(1.0, 0.25, 0.0, 0.95)
+const HIGHLIGHT_COLOR_P1: Color = Color(1.0, 0.95, 0.2, 0.85)   # yellow
+const HIGHLIGHT_COLOR_P2: Color = Color(0.3, 0.7, 1.0, 0.85)    # blue
+const HIGHLIGHT_DAMAGED_P1: Color = Color(1.0, 0.25, 0.0, 0.95) # orange
+const HIGHLIGHT_DAMAGED_P2: Color = Color(0.9, 0.2, 0.5, 0.95)  # pink
 const HIGHLIGHT_COLOR_INTERACT: Color = Color(0.2, 1.0, 0.4, 0.9)
 const NO_COORD: Vector3i = Vector3i(-99999, -99999, -99999)
 
@@ -31,7 +33,7 @@ var _mine_progress: float = 0.0
 var _mine_target: Vector3i = NO_COORD
 var _mine_hardness: float = 1.0
 var _highlight_time: float = 0.0
-var _highlight_base_color: Color = HIGHLIGHT_COLOR_DEFAULT
+var _highlight_base_color: Color = HIGHLIGHT_COLOR_P1
 
 var _highlight: MeshInstance3D = null
 var _highlight_shader_mat: ShaderMaterial = null
@@ -42,9 +44,18 @@ var _mining_vfx: MiningVFX = null
 
 # Layer cycle offset for mine wall targeting (Q/Z keys).
 var _wall_layer_offset: int = 0
+var _layer_cycle_active: bool = false  # true after any Q/Z press
 var _last_wall_qr: Vector2i = Vector2i(-99999, -99999)
 var _wall_targeting_active: bool = false
 var _is_wall_target: bool = false
+
+
+func _default_color() -> Color:
+	return HIGHLIGHT_COLOR_P1 if player_id == 1 else HIGHLIGHT_COLOR_P2
+
+
+func _damaged_color() -> Color:
+	return HIGHLIGHT_DAMAGED_P1 if player_id == 1 else HIGHLIGHT_DAMAGED_P2
 
 
 func set_camera(cam: Camera3D) -> void:
@@ -91,7 +102,7 @@ func _create_highlight() -> void:
 	var shader: Shader = load(_HIGHLIGHT_SHADER_PATH) as Shader
 	_highlight_shader_mat = ShaderMaterial.new()
 	_highlight_shader_mat.shader = shader
-	_highlight_shader_mat.set_shader_parameter("highlight_color", HIGHLIGHT_COLOR_DEFAULT)
+	_highlight_shader_mat.set_shader_parameter("highlight_color", _default_color())
 	_highlight_shader_mat.set_shader_parameter("pulse_time", 0.0)
 	# Exact hex_radius so the ring matches the tile circumradius.
 	var hex_r: float = HexGrid.HEX_SIZE / (diameter * 0.5)
@@ -112,7 +123,7 @@ func _create_wall_highlight() -> void:
 	var shader: Shader = load(_WALL_HIGHLIGHT_SHADER_PATH) as Shader
 	_wall_highlight_shader_mat = ShaderMaterial.new()
 	_wall_highlight_shader_mat.shader = shader
-	_wall_highlight_shader_mat.set_shader_parameter("highlight_color", HIGHLIGHT_COLOR_DEFAULT)
+	_wall_highlight_shader_mat.set_shader_parameter("highlight_color", _default_color())
 	_wall_highlight_shader_mat.set_shader_parameter("pulse_time", 0.0)
 	_wall_highlight_shader_mat.render_priority = 1
 	_wall_highlight.material_override = _wall_highlight_shader_mat
@@ -159,16 +170,18 @@ func _update_target(world: HexWorld) -> void:
 	# overlays / walls in front of them instead of the floor.
 	var facing_coord: Vector3i = _find_facing_cell(world, player_coord, player)
 	if facing_coord != NO_COORD:
-		# Use facing cell when raycast found nothing or only the floor.
-		if raycast_coord == NO_COORD or raycast_coord.z < player_coord.z:
+		# Use facing cell when: user explicitly cycled (Q/Z pressed),
+		# raycast found nothing, or raycast only found the floor.
+		if _layer_cycle_active or raycast_coord == NO_COORD or raycast_coord.z < player_coord.z:
 			_wall_targeting_active = true
 			_set_target_coord(world, facing_coord, false)
 			return
 
-	# Facing-cell targeting not used this frame — reset offset.
+	# Facing-cell targeting not used this frame.
 	if _wall_targeting_active:
 		_wall_targeting_active = false
-		_wall_layer_offset = 0
+		# Don't reset _wall_layer_offset here — it persists until
+		# the player moves to a new hex column or leaves the mine.
 
 	if raycast_coord != NO_COORD:
 		_set_target_coord(world, raycast_coord, false)
@@ -200,11 +213,6 @@ func _find_facing_cell(world: HexWorld, player_coord: Vector3i, player: PlayerCo
 	## Pick the adjacent solid cell the player is facing. Works in both
 	## worlds so the player naturally targets tiles in front of them
 	## rather than the floor beneath.
-	var current_qr: Vector2i = Vector2i(player_coord.x, player_coord.y)
-	if current_qr != _last_wall_qr:
-		_last_wall_qr = current_qr
-		_wall_layer_offset = 0
-
 	var facing_dir: Vector2 = Vector2(
 		sin(player.model.rotation.y), cos(player.model.rotation.y)
 	)
@@ -218,23 +226,25 @@ func _find_facing_cell(world: HexWorld, player_coord: Vector3i, player: PlayerCo
 	else:
 		layers_to_check.append(player_coord.z)
 		layers_to_check.append(player_coord.z - 1)
-	# When offset is negative (looking down), also consider the tile
-	# directly under the player (dq=0, dr=0).
-	var allow_self_column: bool = _wall_layer_offset < 0
+
+	# Offset -1 = "floor mode": return ONLY the tile directly beneath
+	# the player, skip all adjacent walls.
+	if _wall_layer_offset < 0:
+		for target_layer: int in layers_to_check:
+			var c: Vector3i = Vector3i(player_coord.x, player_coord.y, target_layer)
+			if world.has_cell(c):
+				return c
+		return NO_COORD
+
 	for target_layer: int in layers_to_check:
 		for dq: int in range(-1, 2):
 			for dr: int in range(-1, 2):
-				if dq == 0 and dr == 0 and not allow_self_column:
+				if dq == 0 and dr == 0:
 					continue
 				if HexGrid.axial_distance(Vector2i(0, 0), Vector2i(dq, dr)) > 1:
 					continue
 				var c: Vector3i = Vector3i(player_coord.x + dq, player_coord.y + dr, target_layer)
 				if not world.has_cell(c):
-					continue
-				# Self-column (directly below): always valid when looking down.
-				if dq == 0 and dr == 0:
-					best = c
-					best_dot = 2.0  # Guaranteed winner.
 					continue
 				var xz: Vector3 = HexGrid.axial_to_world(dq, dr)
 				var cell_dir: Vector2 = Vector2(xz.x, xz.z).normalized()
@@ -299,32 +309,30 @@ func _set_target_coord(world: HexWorld, coord: Vector3i, is_interactable: bool) 
 		var cell_origin: Vector3 = world.coord_to_world(coord)
 
 		if wall_mode and _wall_highlight != null:
-			# Position the wall highlight on the face between player and target.
+			# Position the wall highlight on the face between player and target,
+			# nudged slightly toward the player to avoid z-fighting.
 			if player:
 				var player_coord: Vector3i = world.world_to_coord(player.global_position)
 				var target_xz: Vector3 = HexGrid.axial_to_world(coord.x, coord.y)
 				var player_xz: Vector3 = HexGrid.axial_to_world(player_coord.x, player_coord.y)
 				var mid_xz: Vector3 = (target_xz + player_xz) * 0.5
 				var wall_y: float = cell_origin.y + HexWorldChunk.LAYER_HEIGHT * 0.5
-				_wall_highlight.global_position = Vector3(mid_xz.x, wall_y, mid_xz.z)
 				# Orient the PlaneMesh vertically: local X → wall-right,
 				# local Y → toward player (normal), local Z → world UP.
 				var to_player: Vector3 = player_xz - target_xz
 				to_player.y = 0.0
 				if to_player.length_squared() > 0.001:
 					to_player = to_player.normalized()
+					# Nudge 2 cm toward player to avoid z-fighting with wall geometry.
+					mid_xz += to_player * 0.02
 					var wall_right: Vector3 = to_player.cross(Vector3.UP).normalized()
 					_wall_highlight.global_basis = Basis(wall_right, to_player, Vector3.UP)
+				_wall_highlight.global_position = Vector3(mid_xz.x, wall_y, mid_xz.z)
 			_wall_highlight.visible = true
 			_highlight.visible = false
 		else:
-			# Flat ring position depends on whether the target is directly
-			# beneath the player. Place it at the bottom of that cell so
-			# it doesn't render on top of the player model.
-			var y_off: float = HexWorldChunk.LAYER_HEIGHT + 0.005
-			if is_same_column:
-				y_off = 0.005  # just above the cell's bottom face
-			_highlight.global_position = cell_origin + Vector3(0.0, y_off, 0.0)
+			# Flat ring just above the top surface of the tile.
+			_highlight.global_position = cell_origin + Vector3(0.0, HexWorldChunk.LAYER_HEIGHT + 0.005, 0.0)
 			_highlight.visible = true
 			if _wall_highlight:
 				_wall_highlight.visible = false
@@ -350,17 +358,17 @@ func _clear_target() -> void:
 		_wall_highlight.visible = false
 	if _crack_overlay:
 		_crack_overlay.reset()
-	_highlight_base_color = HIGHLIGHT_COLOR_DEFAULT
+	_highlight_base_color = _default_color()
 
 
 func _apply_damage_visual(damage: float, hardness: float) -> void:
 	if hardness <= 0.0 or damage <= 0.0:
 		_crack_overlay.reset()
-		_highlight_base_color = HIGHLIGHT_COLOR_DEFAULT
+		_highlight_base_color = _default_color()
 		return
 	var progress: float = clampf(damage / hardness, 0.0, 1.0)
 	_crack_overlay.set_progress(progress)
-	_highlight_base_color = HIGHLIGHT_COLOR_DEFAULT.lerp(HIGHLIGHT_COLOR_DAMAGED, progress)
+	_highlight_base_color = _default_color().lerp(_damaged_color(), progress)
 
 
 func _update_mining(world: HexWorld, delta: float) -> void:
@@ -410,7 +418,7 @@ func _update_mining(world: HexWorld, delta: float) -> void:
 		if _highlight:
 			_highlight.visible = false
 		_crack_overlay.reset()
-		_highlight_base_color = HIGHLIGHT_COLOR_DEFAULT
+		_highlight_base_color = _default_color()
 		var player: PlayerController = get_parent() as PlayerController
 		if player:
 			player.stop_mine_anim()
@@ -438,17 +446,63 @@ func _handle_layer_cycle_input() -> void:
 	if player == null or not player.is_underground:
 		if _wall_layer_offset != 0:
 			_wall_layer_offset = 0
+			_layer_cycle_active = false
 		return
+	# Reset when the player moves to a new hex column (before key
+	# processing so a simultaneous key press overrides the reset).
+	var world: HexWorld = _active_world()
+	if world != null:
+		var pc: Vector3i = world.world_to_coord(player.global_position)
+		var current_qr: Vector2i = Vector2i(pc.x, pc.y)
+		if current_qr != _last_wall_qr:
+			_last_wall_qr = current_qr
+			_wall_layer_offset = 0
+			_layer_cycle_active = false
+	var direction: int = 0
 	if InputManager.is_action_just_pressed(player_id, "target_up"):
-		if _wall_layer_offset >= _MAX_WALL_OFFSET:
-			_wall_layer_offset = -1  # wrap to floor
-		else:
-			_wall_layer_offset += 1
+		direction = 1
 	elif InputManager.is_action_just_pressed(player_id, "target_down"):
-		if _wall_layer_offset <= -1:
-			_wall_layer_offset = _MAX_WALL_OFFSET  # wrap to top
-		else:
-			_wall_layer_offset -= 1
+		direction = -1
+	if direction != 0 and world != null:
+		_layer_cycle_active = true
+		var pc: Vector3i = world.world_to_coord(player.global_position)
+		# Cycle through offsets, skipping any that have no valid cells.
+		var total_steps: int = _MAX_WALL_OFFSET + 2  # -1 through MAX
+		for _attempt: int in total_steps:
+			_wall_layer_offset = _wrap_offset(_wall_layer_offset + direction)
+			if _offset_has_target(world, pc, player):
+				break
+
+
+func _wrap_offset(raw: int) -> int:
+	if raw > _MAX_WALL_OFFSET:
+		return -1
+	if raw < -1:
+		return _MAX_WALL_OFFSET
+	return raw
+
+
+func _offset_has_target(world: HexWorld, player_coord: Vector3i, player: PlayerController) -> bool:
+	## Quick check: does the current _wall_layer_offset have any valid
+	## cell the player could target?
+	var target_layer: int = player_coord.z + _wall_layer_offset
+	if _wall_layer_offset < 0:
+		# Floor mode: check player's own column.
+		return world.has_cell(Vector3i(player_coord.x, player_coord.y, target_layer))
+	# Wall mode: check any adjacent cell at this layer.
+	var facing_dir: Vector2 = Vector2(
+		sin(player.model.rotation.y), cos(player.model.rotation.y)
+	)
+	for dq: int in range(-1, 2):
+		for dr: int in range(-1, 2):
+			if dq == 0 and dr == 0:
+				continue
+			if HexGrid.axial_distance(Vector2i(0, 0), Vector2i(dq, dr)) > 1:
+				continue
+			var c: Vector3i = Vector3i(player_coord.x + dq, player_coord.y + dr, target_layer)
+			if world.has_cell(c):
+				return true
+	return false
 
 
 func _update_highlight_pulse(delta: float) -> void:
