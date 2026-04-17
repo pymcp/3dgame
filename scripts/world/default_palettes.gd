@@ -37,6 +37,21 @@ static func build_overworld() -> TilePalette:
 		_overlay_ore(&"ore_gold", "Gold Deposit", HEX + "stone-rocks.glb", Color(1.0, 0.85, 0.25), 2.0, ["gold_ore"]),
 		_overlay_ore(&"ore_crystal", "Crystal Deposit", HEX + "stone-rocks.glb", Color(0.55, 0.75, 1.0), 2.5, ["crystal"]),
 		_overlay_mine_entrance(),
+		_overlay_workbench(),
+		# --- road overlays (auto-connected by HexRoadResolver) ---
+		_overlay_road(&"road_end", "Road End", HEX + "path-end.glb"),
+		_overlay_road(&"road_straight", "Road Straight", HEX + "path-straight.glb"),
+		_overlay_road(&"road_corner_sharp", "Road Corner Sharp", HEX + "path-corner-sharp.glb"),
+		_overlay_road(&"road_corner", "Road Corner", HEX + "path-corner.glb"),
+		_overlay_road(&"road_intersection_a", "Road T-Fan", HEX + "path-intersectionA.glb"),
+		_overlay_road(&"road_intersection_b", "Road T-Spread", HEX + "path-intersectionB.glb"),
+		_overlay_road(&"road_intersection_c", "Road T-Mirror", HEX + "path-intersectionC.glb"),
+		_overlay_road(&"road_intersection_d", "Road 4-Way A", HEX + "path-intersectionD.glb"),
+		_overlay_road(&"road_intersection_e", "Road 4-Way B", HEX + "path-intersectionE.glb"),
+		_overlay_road(&"road_intersection_f", "Road Y-Junction", HEX + "path-intersectionF.glb"),
+		_overlay_road(&"road_intersection_g", "Road 5-Way", HEX + "path-intersectionG.glb"),
+		_overlay_road(&"road_intersection_h", "Road 4-Way C", HEX + "path-intersectionH.glb"),
+		_overlay_road(&"road_crossing", "Road Crossing", HEX + "path-crossing.glb"),
 	]
 	return pal
 
@@ -67,6 +82,7 @@ static func build_mine() -> TilePalette:
 		_overlay_ore(&"ore_crystal", "Crystal Deposit", HEX + "stone-rocks.glb", Color(0.55, 0.75, 1.0), 2.5, ["crystal"]),
 		_overlay_rocks_mine(),
 		_overlay_ladder_up(),
+		_overlay_workbench(),
 	]
 	return pal
 
@@ -153,4 +169,33 @@ static func _overlay_ladder_up() -> OverlayKind:
 	ok.hardness = 999.0
 	ok.blocks_movement = true
 	ok.marker = &"ladder_up"
+	return ok
+
+
+static func _overlay_workbench() -> OverlayKind:
+	## Crafting station. Drives the `&"workbench"` marker used by the
+	## crafting tab's proximity check.
+	var ok: OverlayKind = OverlayKind.new()
+	ok.id = &"workbench"
+	ok.display_name = "Workbench"
+	# Reuse Kenney survival workbench as the overlay mesh. It's
+	# slightly larger than a hex tile; that's fine for a POI prop.
+	ok.mesh = MeshLoader.load_glb("res://assets/survival/workbench.glb")
+	ok.hardness = 999.0
+	ok.blocks_movement = true
+	ok.marker = &"workbench"
+	return ok
+
+
+static func _overlay_road(id: StringName, display: String, mesh_path: String) -> OverlayKind:
+	var ok: OverlayKind = OverlayKind.new()
+	ok.id = id
+	ok.display_name = display
+	ok.mesh = MeshLoader.load_glb(mesh_path)
+	ok.y_offset = 0.01
+	ok.hardness = 0.5
+	ok.blocks_movement = false
+	ok.drops = PackedStringArray(["stone"])
+	ok.allowed_on_bases = [&"grass", &"dirt", &"sand", &"stone"]
+	ok.marker = &"road"
 	return ok

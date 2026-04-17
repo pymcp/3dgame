@@ -12,6 +12,42 @@ const LAYER_HEIGHT: float = HexGrid.HEX_TILE_HEIGHT  # world-units per layer ste
 ## Adjusted at runtime via `HexWorld.set_overlay_scale(...)`.
 static var overlay_scale_multiplier: float = 1.0
 
+## Precomputed (cos, sin) for 60° rotation steps 0–5. Index 0 is
+## identity (0°), index 1 is 60°, etc. Used by `_write_mmi` for
+## per-instance Y-rotation.
+static var _ROT_TABLE: Array[Vector2] = _build_rot_table()
+
+static func _build_rot_table() -> Array[Vector2]:
+	var t: Array[Vector2] = []
+	for i: int in 6:
+		var angle: float = float(i) * PI / 3.0
+		t.append(Vector2(cos(angle), sin(angle)))
+	return t
+
+## Shared collision shapes (immutable after init). Every chunk reuses
+## these cylinders — `CollisionShape3D.shape` is a resource reference,
+## so thousands of cells all point at the same two `CylinderShape3D`
+## instances. Saves allocation + memory vs. making one per chunk.
+static var _base_cylinder: CylinderShape3D = _make_base_cylinder()
+static var _overlay_cylinder: CylinderShape3D = _make_overlay_cylinder()
+
+
+static func _make_base_cylinder() -> CylinderShape3D:
+	var c: CylinderShape3D = CylinderShape3D.new()
+	c.height = LAYER_HEIGHT
+	c.radius = HexGrid.HEX_SIZE
+	return c
+
+
+static func _make_overlay_cylinder() -> CylinderShape3D:
+	# Thinner + taller for blocking overlays (trees, mountains, hills,
+	# rocks). Thinner avoids diagonal snagging; taller prevents the
+	# player from stepping up over them.
+	var c: CylinderShape3D = CylinderShape3D.new()
+	c.height = LAYER_HEIGHT * 3.0
+	c.radius = HexGrid.HEX_SIZE * 0.8
+	return c
+
 var chunk_pos: Vector3i = Vector3i.ZERO
 var size_qr: int = 16
 var size_layer: int = 4
@@ -141,15 +177,6 @@ func rebuild_collision() -> void:
 	# layer `L` visually occupies `y ∈ [L * LAYER_HEIGHT, (L+1) * LAYER_HEIGHT]`.
 	# Position the collision cylinder so its top matches the mesh top —
 	# otherwise the player lands *inside* the visible tile.
-	var shape_resource: CylinderShape3D = CylinderShape3D.new()
-	shape_resource.height = LAYER_HEIGHT
-	shape_resource.radius = HexGrid.HEX_SIZE
-	# Thinner + taller shared cylinder for blocking overlays (trees,
-	# mountains, hills, rocks). Thinner avoids diagonal snagging; taller
-	# makes sure the player can't step up over them.
-	var overlay_shape: CylinderShape3D = CylinderShape3D.new()
-	overlay_shape.height = LAYER_HEIGHT * 3.0
-	overlay_shape.radius = HexGrid.HEX_SIZE * 0.8
 	for local_key: Variant in cells.keys():
 		var local: Vector3i = local_key as Vector3i
 		var cell: HexCell = cells[local] as HexCell
@@ -157,7 +184,7 @@ func rebuild_collision() -> void:
 		if tk == null:
 			continue
 		var cs: CollisionShape3D = CollisionShape3D.new()
-		cs.shape = shape_resource
+		cs.shape = _base_cylinder
 		var center: Vector3 = _cell_world_center(cell)
 		cs.position = Vector3(center.x, center.y + LAYER_HEIGHT * 0.5, center.z)
 		_collision_body.add_child(cs)
@@ -167,9 +194,9 @@ func rebuild_collision() -> void:
 			var ok: OverlayKind = _palette.overlays[cell.overlay_id]
 			if ok != null and ok.blocks_movement:
 				var ocs: CollisionShape3D = CollisionShape3D.new()
-				ocs.shape = overlay_shape
+				ocs.shape = _overlay_cylinder
 				# Sit the tall cylinder on top of the base tile.
-				ocs.position = Vector3(center.x, center.y + LAYER_HEIGHT + overlay_shape.height * 0.5, center.z)
+				ocs.position = Vector3(center.x, center.y + LAYER_HEIGHT + _overlay_cylinder.height * 0.5, center.z)
 				_collision_body.add_child(ocs)
 				_overlay_collision_shapes[local] = ocs
 
@@ -246,10 +273,21 @@ func _write_mmi(mmi: MultiMeshInstance3D, locals: Array, tint: Color, y_offset: 
 		var cell: HexCell = cells[local] as HexCell
 		var pos: Vector3 = _cell_world_center(cell) + Vector3(0.0, y_offset, 0.0)
 		var offset: int = i * 16
-		# Uniform-scaled basis rows (3x4 layout: basis.x, basis.y, basis.z, origin).
-		buf[offset + 0] = scale; buf[offset + 1] = 0.0;   buf[offset + 2] = 0.0;   buf[offset + 3] = pos.x
-		buf[offset + 4] = 0.0;   buf[offset + 5] = scale; buf[offset + 6] = 0.0;   buf[offset + 7] = pos.y
-		buf[offset + 8] = 0.0;   buf[offset + 9] = 0.0;   buf[offset + 10] = scale; buf[offset + 11] = pos.z
+		if cell.rotation == 0:
+			# Uniform-scaled basis rows (3x4 layout: basis.x, basis.y, basis.z, origin).
+			buf[offset + 0] = scale; buf[offset + 1] = 0.0;   buf[offset + 2] = 0.0;   buf[offset + 3] = pos.x
+			buf[offset + 4] = 0.0;   buf[offset + 5] = scale; buf[offset + 6] = 0.0;   buf[offset + 7] = pos.y
+			buf[offset + 8] = 0.0;   buf[offset + 9] = 0.0;   buf[offset + 10] = scale; buf[offset + 11] = pos.z
+		else:
+			# Rotated basis: Y-rotation by cell.rotation * 60°.
+			var cs: Vector2 = _ROT_TABLE[cell.rotation]
+			var c: float = cs.x * scale
+			var s: float = cs.y * scale
+			# Row-major 3x4: [Xx Xy Xz Tx] [Yx Yy Yz Ty] [Zx Zy Zz Tz]
+			# Y-rotation matrix: [[cos 0 sin] [0 1 0] [-sin 0 cos]]
+			buf[offset + 0] = c;   buf[offset + 1] = 0.0;   buf[offset + 2] = s;     buf[offset + 3] = pos.x
+			buf[offset + 4] = 0.0; buf[offset + 5] = scale; buf[offset + 6] = 0.0;   buf[offset + 7] = pos.y
+			buf[offset + 8] = -s;  buf[offset + 9] = 0.0;   buf[offset + 10] = c;    buf[offset + 11] = pos.z
 		buf[offset + 12] = tint.r; buf[offset + 13] = tint.g; buf[offset + 14] = tint.b; buf[offset + 15] = tint.a
 	mm.buffer = buf
 

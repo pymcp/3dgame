@@ -32,16 +32,14 @@ var _overworld: HexWorld
 var _mine: HexWorld
 var _underground_env: Environment = null
 
-var _mine_entry_progress_p1: float = 0.0
-var _mine_entry_progress_p2: float = 0.0
-var _ladder_exit_progress_p1: float = 0.0
-var _ladder_exit_progress_p2: float = 0.0
+# Per-player state indexed by player_id (1 or 2). Index 0 unused.
+var _mine_entry_progress: Array[float] = [0.0, 0.0, 0.0]
+var _ladder_exit_progress: Array[float] = [0.0, 0.0, 0.0]
 ## After any transition, require the mine key to be released before
 ## another transition can start. Prevents "bounce loop": entering the
 ## mine with F held would land the player on the ladder-up overlay and
 ## immediately trigger exit, back onto a mine-entrance, and so on.
-var _transition_lock_p1: bool = false
-var _transition_lock_p2: bool = false
+var _transition_lock: Array[bool] = [false, false, false]
 
 
 func setup(p1: PlayerController, p2: PlayerController, c1: IsometricCamera, c2: IsometricCamera,
@@ -56,114 +54,55 @@ func setup(p1: PlayerController, p2: PlayerController, c1: IsometricCamera, c2: 
 
 
 func tick(delta: float) -> void:
-	if not _player1.is_underground:
-		_check_mine_entrance(_player1, delta)
-	else:
-		_check_ladder_exit(_player1, delta)
-
-	if not _player2.is_underground:
-		_check_mine_entrance(_player2, delta)
-	else:
-		_check_ladder_exit(_player2, delta)
+	for player: PlayerController in [_player1, _player2]:
+		if player == null:
+			continue
+		if not player.is_underground:
+			_tick_transition(player, delta, _overworld, MARKER_MINE_ENTRANCE,
+					_mine_entry_progress, MINE_ENTRY_TIME, enter_underground)
+		else:
+			_tick_transition(player, delta, _mine, MARKER_LADDER_UP,
+					_ladder_exit_progress, LADDER_EXIT_TIME, exit_underground)
 
 
 func get_mine_entry_progress(player_id: int) -> float:
-	return clampf(_mine_entry_progress_p1 if player_id == 1 else _mine_entry_progress_p2, 0.0, 1.0)
+	return clampf(_mine_entry_progress[player_id], 0.0, 1.0)
 
 
 func get_ladder_exit_progress(player_id: int) -> float:
-	return clampf(_ladder_exit_progress_p1 if player_id == 1 else _ladder_exit_progress_p2, 0.0, 1.0)
+	return clampf(_ladder_exit_progress[player_id], 0.0, 1.0)
 
 
 func _standing_on_marker(world: HexWorld, player: PlayerController, marker: StringName) -> bool:
-	if world == null or world.palette == null:
+	if world == null:
 		return false
 	var coord: Vector3i = world.world_to_coord(player.global_position)
-	# Marker overlays now block movement, so the player can't stand on
-	# them. Count any cell within 1 hex of the player (same layer, ±1
-	# layer) as "activating" the marker.
-	for dy: int in [0, -1, 1]:
-		for dq: int in range(-1, 2):
-			for dr: int in range(-1, 2):
-				var c: Vector3i = Vector3i(coord.x + dq, coord.y + dr, coord.z + dy)
-				if HexGrid.axial_distance(Vector2i(coord.x, coord.y), Vector2i(c.x, c.y)) > 1:
-					continue
-				var cell: HexCell = world.get_cell(c)
-				if cell == null or not cell.has_overlay():
-					continue
-				var ok: OverlayKind = world.palette.overlays[cell.overlay_id]
-				if ok != null and ok.marker == marker:
-					return true
-	return false
+	return world.find_nearby_marker(coord, marker) != HexWorld.NO_COORD
 
 
-func _check_mine_entrance(player: PlayerController, delta: float) -> void:
-	var is_p1: bool = player.player_id == 1
-	var key_down: bool = InputManager.is_action_pressed(player.player_id, "mine")
+## Shared tick for entry OR exit. `progress` is the 3-element array
+## indexed by player_id; `on_complete` is called with the player once
+## progress reaches 1.0.
+func _tick_transition(player: PlayerController, delta: float, world: HexWorld,
+		marker: StringName, progress: Array[float], duration: float,
+		on_complete: Callable) -> void:
+	var pid: int = player.player_id
+	var key_down: bool = InputManager.is_action_pressed(pid, "mine")
 	# Clear the post-transition lock once the player lets go.
-	if is_p1:
-		if _transition_lock_p1 and not key_down:
-			_transition_lock_p1 = false
+	if _transition_lock[pid] and not key_down:
+		_transition_lock[pid] = false
+
+	var near_marker: bool = _standing_on_marker(world, player, marker)
+	var holding: bool = near_marker and key_down and not _transition_lock[pid]
+
+	if holding:
+		progress[pid] += delta / duration
+		if progress[pid] >= 1.0:
+			progress[pid] = 0.0
+			_transition_lock[pid] = true
+			on_complete.call(player)
 	else:
-		if _transition_lock_p2 and not key_down:
-			_transition_lock_p2 = false
-
-	var locked: bool = _transition_lock_p1 if is_p1 else _transition_lock_p2
-	var on_mine: bool = _standing_on_marker(_overworld, player, MARKER_MINE_ENTRANCE)
-	var holding: bool = on_mine and key_down and not locked
-
-	if is_p1:
-		if holding:
-			_mine_entry_progress_p1 += delta / MINE_ENTRY_TIME
-			if _mine_entry_progress_p1 >= 1.0:
-				_mine_entry_progress_p1 = 0.0
-				_transition_lock_p1 = true
-				enter_underground(player)
-		else:
-			_mine_entry_progress_p1 = 0.0
-	else:
-		if holding:
-			_mine_entry_progress_p2 += delta / MINE_ENTRY_TIME
-			if _mine_entry_progress_p2 >= 1.0:
-				_mine_entry_progress_p2 = 0.0
-				_transition_lock_p2 = true
-				enter_underground(player)
-		else:
-			_mine_entry_progress_p2 = 0.0
-
-
-func _check_ladder_exit(player: PlayerController, delta: float) -> void:
-	var is_p1: bool = player.player_id == 1
-	var key_down: bool = InputManager.is_action_pressed(player.player_id, "mine")
-	if is_p1:
-		if _transition_lock_p1 and not key_down:
-			_transition_lock_p1 = false
-	else:
-		if _transition_lock_p2 and not key_down:
-			_transition_lock_p2 = false
-
-	var locked: bool = _transition_lock_p1 if is_p1 else _transition_lock_p2
-	var near_ladder: bool = _standing_on_marker(_mine, player, MARKER_LADDER_UP)
-	var holding: bool = near_ladder and key_down and not locked
-
-	if is_p1:
-		if holding:
-			_ladder_exit_progress_p1 += delta / LADDER_EXIT_TIME
-			if _ladder_exit_progress_p1 >= 1.0:
-				_ladder_exit_progress_p1 = 0.0
-				_transition_lock_p1 = true
-				exit_underground(player)
-		else:
-			_ladder_exit_progress_p1 = 0.0
-	else:
-		if holding:
-			_ladder_exit_progress_p2 += delta / LADDER_EXIT_TIME
-			if _ladder_exit_progress_p2 >= 1.0:
-				_ladder_exit_progress_p2 = 0.0
-				_transition_lock_p2 = true
-				exit_underground(player)
-		else:
-			_ladder_exit_progress_p2 = 0.0
+		progress[pid] = 0.0
 
 
 func enter_underground(player: PlayerController) -> void:

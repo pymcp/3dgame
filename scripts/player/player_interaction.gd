@@ -49,6 +49,11 @@ var _last_wall_qr: Vector2i = Vector2i(-99999, -99999)
 var _wall_targeting_active: bool = false
 var _is_wall_target: bool = false
 
+# Cache the last bitmask applied by `_sync_widget_render_layers` so the
+# recursive tree walk over `_mining_vfx` only runs when the player's
+# world actually changes (i.e. during a mine transition), not every frame.
+var _last_widget_bitmask: int = -1
+
 
 func _default_color() -> Color:
 	return HIGHLIGHT_COLOR_P1 if player_id == 1 else HIGHLIGHT_COLOR_P2
@@ -190,23 +195,8 @@ func _update_target(world: HexWorld) -> void:
 
 
 func _find_nearby_marker(world: HexWorld, player_coord: Vector3i) -> Vector3i:
-	if world.palette == null:
-		return NO_COORD
-	for dy: int in [0, -1, 1]:
-		for dq: int in range(-1, 2):
-			for dr: int in range(-1, 2):
-				if HexGrid.axial_distance(Vector2i(0, 0), Vector2i(dq, dr)) > 1:
-					continue
-				var c: Vector3i = Vector3i(player_coord.x + dq, player_coord.y + dr, player_coord.z + dy)
-				var cell: HexCell = world.get_cell(c)
-				if cell == null or not cell.has_overlay():
-					continue
-				if cell.overlay_id < 0 or cell.overlay_id >= world.palette.overlays.size():
-					continue
-				var ok: OverlayKind = world.palette.overlays[cell.overlay_id]
-				if ok != null and ok.marker != &"":
-					return c
-	return NO_COORD
+	var c: Vector3i = world.find_nearby_marker(player_coord)
+	return NO_COORD if c == HexWorld.NO_COORD else c
 
 
 func _find_facing_cell(world: HexWorld, player_coord: Vector3i, player: PlayerController) -> Vector3i:
@@ -219,34 +209,29 @@ func _find_facing_cell(world: HexWorld, player_coord: Vector3i, player: PlayerCo
 	var best: Vector3i = NO_COORD
 	var best_dot: float = 0.3  # ~70° arc threshold
 	# Layer-cycle offset applies in both worlds for identical behavior.
-	var layers_to_check: Array[int] = []
-	layers_to_check.append(player_coord.z + _wall_layer_offset)
+	var target_layer: int = player_coord.z + _wall_layer_offset
 
 	# Offset -1 = "floor mode": return ONLY the tile directly beneath
 	# the player, skip all adjacent walls.
 	if _wall_layer_offset < 0:
-		for target_layer: int in layers_to_check:
-			var c: Vector3i = Vector3i(player_coord.x, player_coord.y, target_layer)
-			if world.has_cell(c):
-				return c
-		return NO_COORD
+		var floor_c: Vector3i = Vector3i(player_coord.x, player_coord.y, target_layer)
+		return floor_c if world.has_cell(floor_c) else NO_COORD
 
-	for target_layer: int in layers_to_check:
-		for dq: int in range(-1, 2):
-			for dr: int in range(-1, 2):
-				if dq == 0 and dr == 0:
-					continue
-				if HexGrid.axial_distance(Vector2i(0, 0), Vector2i(dq, dr)) > 1:
-					continue
-				var c: Vector3i = Vector3i(player_coord.x + dq, player_coord.y + dr, target_layer)
-				if not world.has_cell(c):
-					continue
-				var xz: Vector3 = HexGrid.axial_to_world(dq, dr)
-				var cell_dir: Vector2 = Vector2(xz.x, xz.z).normalized()
-				var dot: float = facing_dir.dot(cell_dir)
-				if dot > best_dot:
-					best_dot = dot
-					best = c
+	for dq: int in range(-1, 2):
+		for dr: int in range(-1, 2):
+			if dq == 0 and dr == 0:
+				continue
+			if HexGrid.axial_distance(Vector2i(0, 0), Vector2i(dq, dr)) > 1:
+				continue
+			var c: Vector3i = Vector3i(player_coord.x + dq, player_coord.y + dr, target_layer)
+			if not world.has_cell(c):
+				continue
+			var xz: Vector3 = HexGrid.axial_to_world(dq, dr)
+			var cell_dir: Vector2 = Vector2(xz.x, xz.z).normalized()
+			var dot: float = facing_dir.dot(cell_dir)
+			if dot > best_dot:
+				best_dot = dot
+				best = c
 	return best
 
 
@@ -367,11 +352,17 @@ func _apply_damage_visual(damage: float, hardness: float) -> void:
 
 
 func _update_mining(world: HexWorld, delta: float) -> void:
+	var player: PlayerController = get_parent() as PlayerController
+	if player != null and player.is_input_blocked():
+		if _is_mining:
+			_is_mining = false
+			_mining_vfx.stop()
+			player.stop_mine_anim()
+		return
 	if not InputManager.is_action_pressed(player_id, "mine"):
 		if _is_mining:
 			_is_mining = false
 			_mining_vfx.stop()
-			var player: PlayerController = get_parent() as PlayerController
 			if player:
 				player.stop_mine_anim()
 		return
@@ -390,13 +381,16 @@ func _update_mining(world: HexWorld, delta: float) -> void:
 		_mine_hardness = hardness
 		_mine_progress = world.get_damage(_targeted_coord)
 		var center: Vector3 = world.coord_to_world(_mine_target) + Vector3(0.0, HexWorldChunk.LAYER_HEIGHT * 0.5, 0.0)
-		var player: PlayerController = get_parent() as PlayerController
 		if player:
 			player.face_target(center)
 			player.play_mine_anim()
 		_mining_vfx.start(center, Color(1, 1, 1))
 
-	_mine_progress += delta
+	# Pickaxe tier scales damage accumulation. Pickaxe is always implicit.
+	var speed_mult: float = 1.0
+	if player:
+		speed_mult = player.get_mine_speed_multiplier()
+	_mine_progress += delta * speed_mult
 	world.set_damage(_mine_target, _mine_progress)
 	_apply_damage_visual(_mine_progress, _mine_hardness)
 
@@ -414,7 +408,6 @@ func _update_mining(world: HexWorld, delta: float) -> void:
 			_highlight.visible = false
 		_crack_overlay.reset()
 		_highlight_base_color = _default_color()
-		var player: PlayerController = get_parent() as PlayerController
 		if player:
 			player.stop_mine_anim()
 
@@ -517,8 +510,12 @@ func _sync_widget_render_layers() -> void:
 	if player == null:
 		return
 	# Match the player's current render layer bitmask so the highlight,
-	# crack overlay, and VFX are visible on the correct camera.
+	# crack overlay, and VFX are visible on the correct camera. Skip
+	# the recursive VFX walk when nothing has changed.
 	var bitmask: int = 2 if not player.is_underground else 4
+	if bitmask == _last_widget_bitmask:
+		return
+	_last_widget_bitmask = bitmask
 	if _highlight:
 		_highlight.layers = bitmask
 	if _wall_highlight:

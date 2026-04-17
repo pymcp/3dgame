@@ -14,6 +14,9 @@ var base_id: int = 0
 var overlay_id: int = -1
 ## Extra hex-scale elevation added on top of `layer * LAYER_HEIGHT` (typically 0).
 var elevation: float = 0.0
+## Y-rotation in 60° increments (0–5). 0 = 0°, 1 = 60°, … 5 = 300°.
+## Used by road overlays and any future rotated tiles.
+var rotation: int = 0
 
 
 func _init(q_val: int = 0, r_val: int = 0, layer_val: int = 0, base: int = 0, overlay: int = -1) -> void:

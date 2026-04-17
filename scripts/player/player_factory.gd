@@ -19,6 +19,24 @@ static func build(id: int, skin: String, pos: Vector3) -> PlayerController:
 	inv.name = "Inventory"
 	player.add_child(inv)
 
+	var eq: PlayerEquipment = PlayerEquipment.new()
+	eq.name = "Equipment"
+	eq.set_inventory(inv)
+	player.add_child(eq)
+	player.equipment = eq
+	# Mirror weapon-slot equip/unequip to the visible held-tool, so an
+	# equipped sword shows up in the character's hand (and is restored
+	# after mining). Mining always shows the implicit pickaxe — see
+	# `PlayerController.play_mine_anim`.
+	eq.equipped.connect(func(slot: StringName, item_id: StringName) -> void:
+		if slot == &"weapon" and not player._mining_active:
+			player.set_held_tool(item_id)
+	)
+	eq.unequipped.connect(func(slot: StringName, _item_id: StringName) -> void:
+		if slot == &"weapon" and not player._mining_active:
+			player.set_held_tool(&"")
+	)
+
 	var interact: PlayerInteraction = PlayerInteraction.new()
 	interact.name = "Interaction"
 	interact.player_id = id

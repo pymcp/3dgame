@@ -10,6 +10,9 @@ extends CharacterBody3D
 ## Character scale. Changing this at runtime via `set_player_size()`
 ## rescales the model, collision capsule, and `move_speed` together.
 @export var player_size: float = 0.15
+## Implicit pickaxe tier. The pickaxe is NEVER an inventory item — it
+## is always held when mining. Upgraded via crafting later (tier 2/3).
+@export var pickaxe_tier: int = 1
 
 ## Jump velocity computed so a single jump clears 1 LAYER_HEIGHT + margin,
 ## and a double jump clears 2 layers.  h = v² / (2g) → v = sqrt(2·g·h).
@@ -25,6 +28,14 @@ var _current_anim: String = "idle"
 var _mining_active: bool = false
 var _mine_face_angle: float = 0.0
 var _jumps_remaining: int = MAX_JUMPS
+## Blocks movement + action input (used by the character sheet modal).
+var _input_blocked: bool = false
+## Tool currently held in the character's hand (visual). &"" = no tool.
+## Swapped to pickaxe automatically during mining.
+var _held_tool_id: StringName = &""
+var _held_tool_node: Node3D = null
+## Back-reference so `stop_mine_anim` can restore the equipped weapon.
+var equipment: PlayerEquipment = null
 
 # Isometric direction rotation: 45 degrees to align WASD with isometric axes
 const ISO_ROTATION: float = -PI / 4.0
@@ -140,7 +151,7 @@ func _load_character_animations(target_ap: AnimationPlayer) -> void:
 
 
 func _physics_process(delta: float) -> void:
-	var input_vec: Vector2 = InputManager.get_move_vector(player_id)
+	var input_vec: Vector2 = Vector2.ZERO if _input_blocked else InputManager.get_move_vector(player_id)
 
 	# Rotate input for isometric perspective
 	var rotated: Vector2 = input_vec.rotated(ISO_ROTATION)
@@ -173,7 +184,7 @@ func _physics_process(delta: float) -> void:
 		_jumps_remaining = MAX_JUMPS
 
 	# Jump / double-jump
-	if InputManager.is_action_just_pressed(player_id, "jump") and _jumps_remaining > 0:
+	if not _input_blocked and InputManager.is_action_just_pressed(player_id, "jump") and _jumps_remaining > 0:
 		velocity.y = JUMP_VELOCITY
 		_jumps_remaining -= 1
 		if not _mining_active:
@@ -206,6 +217,8 @@ func play_mine_anim() -> void:
 	_play_anim("attack")
 	if anim_player and not anim_player.animation_finished.is_connected(_on_mine_anim_finished):
 		anim_player.animation_finished.connect(_on_mine_anim_finished)
+	# Show pickaxe in hand regardless of equipped weapon.
+	set_held_tool(_pickaxe_glb_for_tier())
 
 
 func stop_mine_anim() -> void:
@@ -214,6 +227,17 @@ func stop_mine_anim() -> void:
 		anim_player.animation_finished.disconnect(_on_mine_anim_finished)
 	_current_anim = ""  # Force transition back to idle
 	_play_anim("idle")
+	# Restore the equipped weapon (or empty hands).
+	if equipment != null:
+		set_held_tool(equipment.get_equipped(&"weapon"))
+	else:
+		set_held_tool(&"")
+
+
+func _pickaxe_glb_for_tier() -> String:
+	if pickaxe_tier >= 2:
+		return "res://assets/survival/tool-pickaxe-upgraded.glb"
+	return "res://assets/survival/tool-pickaxe.glb"
 
 
 func face_target(target_pos: Vector3) -> void:
@@ -303,3 +327,83 @@ func _find_all_mesh_instances(node: Node) -> Array[MeshInstance3D]:
 	for child: Node in node.get_children():
 		result.append_array(_find_all_mesh_instances(child))
 	return result
+
+
+## Block / unblock gameplay input (movement, jump). Used by the
+## character sheet modal so opening it freezes the player.
+func set_input_blocked(blocked: bool) -> void:
+	_input_blocked = blocked
+	if blocked:
+		# Zero lateral motion so the character stops in place when the
+		# sheet opens mid-stride.
+		velocity.x = 0.0
+		velocity.z = 0.0
+
+
+func is_input_blocked() -> bool:
+	return _input_blocked
+
+
+## Tier-based mining speed multiplier. Pickaxe is always implicit —
+## this value scales the damage-per-second accumulation in
+## `PlayerInteraction._update_mining`.
+func get_mine_speed_multiplier() -> float:
+	match pickaxe_tier:
+		1: return 1.0
+		2: return 1.5
+		3: return 2.25
+	return 1.0
+
+
+## Swap the visible tool held in the character's hand. Pass &"" to
+## clear. Called from `play_mine_anim` to show the pickaxe and from
+## `PlayerEquipment.equipped` on the weapon slot to show the weapon.
+##
+## v1: the tool is attached as a child of the character model with no
+## bone attachment — Kenney's animated characters don't ship a skeleton
+## socket. This is a visible-held-tool placeholder that will be
+## improved when bone attachment lands.
+func set_held_tool(tool_id_or_path: Variant) -> void:
+	var key: StringName = _to_string_name(tool_id_or_path)
+	if key == _held_tool_id:
+		return
+	_held_tool_id = key
+	if _held_tool_node != null:
+		_held_tool_node.queue_free()
+		_held_tool_node = null
+	if key == &"":
+		return
+	var mesh: Mesh = null
+	# If it's a path to a .glb, load it directly; otherwise treat as
+	# an ItemDef id.
+	var path: String = String(key)
+	if path.ends_with(".glb"):
+		mesh = MeshLoader.load_glb(path)
+	else:
+		var def: ItemDef = ItemRegistry.get_def(key)
+		if def != null and def.model_scene_path != "":
+			mesh = MeshLoader.load_glb(def.model_scene_path)
+	if mesh == null or model == null:
+		return
+	var mi: MeshInstance3D = MeshInstance3D.new()
+	mi.mesh = mesh
+	# Offset roughly where the hand would be. Model is scaled via
+	# `player_size` — this is in model-local units so it rides along.
+	mi.position = Vector3(0.6, 1.1, 0.0)
+	mi.rotation_degrees = Vector3(0.0, 0.0, -45.0)
+	mi.scale = Vector3(1.3, 1.3, 1.3)
+	# Ensure the tool renders on the same layers the rest of the
+	# character model uses (set by apply_render_layers).
+	mi.layers = 2 if not is_underground else 4
+	model.add_child(mi)
+	_held_tool_node = mi
+
+
+func get_held_tool_id() -> StringName:
+	return _held_tool_id
+
+
+static func _to_string_name(v: Variant) -> StringName:
+	if v is StringName:
+		return v
+	return StringName(v)

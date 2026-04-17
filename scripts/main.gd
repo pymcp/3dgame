@@ -21,16 +21,20 @@ const MINE_CAM_MASK: int = 5          # layers 1 + 3
 var world: Node3D
 var overworld: HexWorld
 var mine: HexWorld
+var overworld_pathfinder: HexPathfinder
+var mine_pathfinder: HexPathfinder
+var overworld_spawner: CreatureSpawner
+var mine_spawner: CreatureSpawner
 
 var player1: PlayerController
 var player2: PlayerController
 var camera1: IsometricCamera
 var camera2: IsometricCamera
 
-var inventory_ui_p1: InventoryUI
-var inventory_ui_p2: InventoryUI
 var mining_ui_p1: MiningProgressUI
 var mining_ui_p2: MiningProgressUI
+var character_sheet_p1: CharacterSheet
+var character_sheet_p2: CharacterSheet
 
 var tile_placer: TilePlacer
 var pause_menu: PauseMenu
@@ -55,7 +59,7 @@ func _ready() -> void:
 	_setup_decorations()
 	_setup_tile_placer()
 	_setup_pause_menu()
-
+	_setup_creatures()
 
 func _setup_world() -> void:
 	world = Node3D.new()
@@ -211,16 +215,6 @@ func _setup_player_ui(vp: SubViewport, id: int, inv: Inventory, interact: Player
 	controls.text = "%s  Move\n%s  Mine\n%s  Inventory" % [move_hint, mine_hint, inv_hint]
 	ui_root.add_child(controls)
 
-	var inv_ui: InventoryUI = InventoryUI.new()
-	inv_ui.player_id = id
-	inv_ui.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	ui_root.add_child(inv_ui)
-	inv_ui.set_inventory.call_deferred(inv)
-	if id == 1:
-		inventory_ui_p1 = inv_ui
-	else:
-		inventory_ui_p2 = inv_ui
-
 	var mine_ui: MiningProgressUI = MiningProgressUI.new()
 	mine_ui.player_id = id
 	mine_ui.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
@@ -230,6 +224,17 @@ func _setup_player_ui(vp: SubViewport, id: int, inv: Inventory, interact: Player
 		mining_ui_p1 = mine_ui
 	else:
 		mining_ui_p2 = mine_ui
+
+	# Character sheet (full inventory + equipment + crafting modal).
+	var sheet: CharacterSheet = CharacterSheet.new()
+	ui_root.add_child(sheet)
+	var player: PlayerController = player1 if id == 1 else player2
+	var eq: PlayerEquipment = player.get_node("Equipment") as PlayerEquipment
+	sheet.configure.call_deferred(id, inv, eq, overworld, mine, player)
+	if id == 1:
+		character_sheet_p1 = sheet
+	else:
+		character_sheet_p2 = sheet
 
 
 ## Compact label for the 4 movement actions. Collapses "W A S D" →
@@ -299,11 +304,58 @@ func _setup_decorations() -> void:
 	var mine_deco: HexDecorator = DefaultDecorators.build_mine_spawn_chamber()
 	HexDecoratorNode.apply(mine, Vector3i(0, 0, 0), mine_deco)
 
+	# Place a workbench overlay adjacent to the spawn ladder so the
+	# crafting tab's nearness check has something to snap to. Offset
+	# 2 axial hexes east of the ladder at layer 0 so it sits on the
+	# chamber floor.
+	var wb_coord: Vector3i = Vector3i(2, 0, 0)
+	var wb_idx: int = mine.palette.overlay_index_by_marker(&"workbench")
+	if wb_idx >= 0:
+		mine.prime_around(mine.coord_to_world(wb_coord))
+		# Make sure a floor exists beneath the workbench (the ladder
+		# chamber has open air at layer 0, floor at -1).
+		if not mine.has_cell(wb_coord):
+			var floor_base: int = mine.palette.base_index(&"dark_stone")
+			if floor_base >= 0:
+				mine.place_base(wb_coord, floor_base)
+		mine.place_overlay(wb_coord, wb_idx)
+
 
 func _setup_tile_placer() -> void:
 	tile_placer = TilePlacer.new()
 	tile_placer.name = "TilePlacer"
 	add_child(tile_placer)
+
+
+func _setup_creatures() -> void:
+	# One pathfinder per world. Pathfinder reactively updates as
+	# chunks load/unload and as cells are mined/placed.
+	overworld_pathfinder = HexPathfinder.new(overworld)
+	mine_pathfinder = HexPathfinder.new(mine)
+
+	# Overworld spawner — orcs, skeletons, zombies wander the surface.
+	overworld_spawner = CreatureSpawner.new()
+	overworld_spawner.name = "OverworldCreatureSpawner"
+	overworld_spawner.creature_defs = [
+		DefaultCreatures.build_orc(),
+		DefaultCreatures.build_skeleton(),
+		DefaultCreatures.build_zombie(),
+	]
+	overworld_spawner.max_alive = 6
+	overworld_spawner.spawn_interval = 5.0
+	overworld_spawner.spawn_radius = 12
+	overworld_spawner.min_player_distance = 5
+	overworld_spawner.despawn_distance = 22
+	overworld.add_child(overworld_spawner)
+	overworld_spawner.setup(overworld, overworld_pathfinder)
+
+	# Mine spawner — disabled by default until we add mine-specific
+	# creature defs (skeletons could re-skin to fit the mine theme).
+	mine_spawner = CreatureSpawner.new()
+	mine_spawner.name = "MineCreatureSpawner"
+	mine_spawner.set_enabled(false)
+	mine.add_child(mine_spawner)
+	mine_spawner.setup(mine, mine_pathfinder)
 
 
 func _setup_pause_menu() -> void:
@@ -353,6 +405,16 @@ func _process(delta: float) -> void:
 			mine_players.append(player2)
 	overworld.set_active_players(ow_players)
 	mine.set_active_players(mine_players)
+	if overworld_spawner != null:
+		var ow_pcs: Array[PlayerController] = []
+		for n: Node3D in ow_players:
+			ow_pcs.append(n as PlayerController)
+		overworld_spawner.set_active_players(ow_pcs)
+	if mine_spawner != null:
+		var mine_pcs: Array[PlayerController] = []
+		for n: Node3D in mine_players:
+			mine_pcs.append(n as PlayerController)
+		mine_spawner.set_active_players(mine_pcs)
 
 	# Drive the tile occlusion cutout around each player. When a player
 	# is disabled, mark their slot inactive so the shader skips them.
@@ -374,6 +436,9 @@ func _unhandled_input(event: InputEvent) -> void:
 		elif key.keycode == KEY_F9:
 			_magic_drop_mine_entrance()
 			get_viewport().set_input_as_handled()
+		elif key.keycode == KEY_F10:
+			_debug_place_road()
+			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_PAGEUP:
 			_change_player_size(0.005)
 			get_viewport().set_input_as_handled()
@@ -381,10 +446,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			_change_player_size(-0.005)
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_HOME:
-			_change_overlay_scale(0.1)
+			_change_creature_scale(0.01)
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_END:
-			_change_overlay_scale(-0.1)
+			_change_creature_scale(-0.01)
 			get_viewport().set_input_as_handled()
 
 
@@ -401,14 +466,17 @@ func _change_player_size(delta: float) -> void:
 	Toast.push("Scale: %.3f" % new_size)
 
 
-## Debug: adjust the global overlay scale multiplier (trees, rocks,
-## ores — base tiles unaffected) by `delta` and rebuild visuals on both
-## worlds. Bound to Home / End.
-func _change_overlay_scale(delta: float) -> void:
-	var new_scale: float = clampf(HexWorldChunk.overlay_scale_multiplier + delta, 0.1, 8.0)
-	overworld.set_overlay_scale(new_scale)
-	mine.set_overlay_scale(new_scale)
-	Toast.push("Overlay scale: %.2f" % new_scale)
+## Debug: adjust all creature scales by `delta`. Bound to Home / End.
+func _change_creature_scale(delta: float) -> void:
+	var current: float = 0.25
+	if overworld_spawner != null and not overworld_spawner.creature_defs.is_empty():
+		current = overworld_spawner.creature_defs[0].model_scale
+	var new_scale: float = clampf(current + delta, 0.02, 2.0)
+	if overworld_spawner != null:
+		overworld_spawner.set_creature_scale(new_scale)
+	if mine_spawner != null:
+		mine_spawner.set_creature_scale(new_scale)
+	Toast.push("Creature scale: %.3f" % new_scale)
 
 
 ## Debug: drop a mine-entrance overlay from the sky onto an overworld
@@ -478,8 +546,62 @@ func _magic_drop_mine_entrance() -> void:
 		mine_scene,
 		target_world,
 		null,
-		func() -> void: overworld.place_overlay(target_coord, overlay_idx),
+		func() -> void:
+			overworld.place_overlay(target_coord, overlay_idx)
+			_auto_route_road_to_nearest_mine(target_coord),
 	)
+
+
+## After placing a mine entrance, route a road to the nearest other mine.
+## Uses the overworld pathfinder for A* pathing through loaded chunks.
+func _auto_route_road_to_nearest_mine(new_mine_coord: Vector3i) -> void:
+	var all_mines: Array[Vector3i] = overworld.find_all_markers(&"mine_entrance")
+	var best_coord: Vector3i = Vector3i.ZERO
+	var best_dist: int = 999999
+	for mc: Vector3i in all_mines:
+		if mc == new_mine_coord:
+			continue
+		var dist: int = HexGrid.axial_distance(
+			Vector2i(mc.x, mc.y), Vector2i(new_mine_coord.x, new_mine_coord.y))
+		if dist < best_dist:
+			best_dist = dist
+			best_coord = mc
+
+	if best_dist >= 999999:
+		Toast.push("No nearby mine found for road", Color.YELLOW)
+		return
+
+	# Use same layer as the new mine (surface layer 0 by default).
+	var from_coord: Vector3i = Vector3i(new_mine_coord.x, new_mine_coord.y, new_mine_coord.z)
+	var to_coord: Vector3i = Vector3i(best_coord.x, best_coord.y, best_coord.z)
+
+	var path: Array[Vector3i] = overworld_pathfinder.find_path(from_coord, to_coord)
+	if path.is_empty():
+		Toast.push("No path found to nearest mine", Color.YELLOW)
+		return
+
+	var placed_count: int = 0
+	for coord: Vector3i in path:
+		if HexRoadPlacer.place_road(overworld, coord):
+			placed_count += 1
+	Toast.push("Road built: %d tiles" % placed_count)
+
+
+## Debug: place a road tile at the player's current hex. Triggered by F10.
+func _debug_place_road() -> void:
+	var anchor: PlayerController = null
+	if _p1_enabled and not player1.is_underground:
+		anchor = player1
+	elif _p2_enabled and not player2.is_underground:
+		anchor = player2
+	if anchor == null:
+		Toast.push("Must be on the surface", Color.YELLOW)
+		return
+	var coord: Vector3i = overworld.world_to_coord(anchor.global_position)
+	if HexRoadPlacer.place_road(overworld, coord):
+		Toast.push("Road placed")
+	else:
+		Toast.push("Cannot place road here", Color.YELLOW)
 
 
 func _on_mine_completed(coord: Vector3i, drops: PackedStringArray, dropped_base: bool, player_id: int) -> void:

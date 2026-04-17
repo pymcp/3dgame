@@ -80,11 +80,17 @@ func _process(delta: float) -> void:
 func _update_streaming() -> void:
 	if palette == null or generator == null:
 		return
-	var wanted: Dictionary = {}  # Vector3i chunk_pos -> true
+	# Cache each active player's chunk center once so `wanted` build
+	# AND `_is_outside_unload_radius` both reuse the same centers
+	# (previously each of N loaded chunks recomputed the centers,
+	# which is O(chunks × players) per tick).
+	var centers: Array[Vector3i] = []
 	for player: Node3D in _active_players:
-		if not is_instance_valid(player):
-			continue
-		var center: Vector3i = _chunk_at_world(player.global_position)
+		if is_instance_valid(player):
+			centers.append(_chunk_at_world(player.global_position))
+
+	var wanted: Dictionary = {}  # Vector3i chunk_pos -> true
+	for center: Vector3i in centers:
 		for dz: int in range(-load_radius_layer, load_radius_layer + 1):
 			for dq: int in range(-load_radius_qr, load_radius_qr + 1):
 				for dr: int in range(-load_radius_qr, load_radius_qr + 1):
@@ -99,17 +105,14 @@ func _update_streaming() -> void:
 	var to_unload: Array[Vector3i] = []
 	for cp_v: Variant in _chunks.keys():
 		var cp: Vector3i = cp_v as Vector3i
-		if _is_outside_unload_radius(cp):
+		if _is_outside_unload_radius(cp, centers):
 			to_unload.append(cp)
 	for cp: Vector3i in to_unload:
 		_unload_chunk(cp)
 
 
-func _is_outside_unload_radius(cp: Vector3i) -> bool:
-	for player: Node3D in _active_players:
-		if not is_instance_valid(player):
-			continue
-		var center: Vector3i = _chunk_at_world(player.global_position)
+func _is_outside_unload_radius(cp: Vector3i, centers: Array[Vector3i]) -> bool:
+	for center: Vector3i in centers:
 		if absi(cp.x - center.x) <= unload_radius_qr \
 			and absi(cp.y - center.y) <= unload_radius_qr \
 			and absi(cp.z - center.z) <= unload_radius_layer:
@@ -276,6 +279,38 @@ func has_cell(coord: Vector3i) -> bool:
 	return get_cell(coord) != null
 
 
+## Search for a cell with a marker overlay within axial distance 1
+## (same layer and ±1 layer) of `coord`. Pass an empty marker
+## (`&""`) to match any marker; otherwise only overlays whose
+## `OverlayKind.marker == marker` are returned. Returns the matching
+## coord, or `NO_COORD` if no match was found.
+const NO_COORD: Vector3i = Vector3i(-99999, -99999, -99999)
+
+func find_nearby_marker(coord: Vector3i, marker: StringName = &"") -> Vector3i:
+	if palette == null:
+		return NO_COORD
+	for dy: int in [0, -1, 1]:
+		for dq: int in range(-1, 2):
+			for dr: int in range(-1, 2):
+				if HexGrid.axial_distance(Vector2i(0, 0), Vector2i(dq, dr)) > 1:
+					continue
+				var c: Vector3i = Vector3i(coord.x + dq, coord.y + dr, coord.z + dy)
+				var cell: HexCell = get_cell(c)
+				if cell == null or not cell.has_overlay():
+					continue
+				if cell.overlay_id < 0 or cell.overlay_id >= palette.overlays.size():
+					continue
+				var ok: OverlayKind = palette.overlays[cell.overlay_id]
+				if ok == null:
+					continue
+				if marker == &"":
+					if ok.marker != &"":
+						return c
+				elif ok.marker == marker:
+					return c
+	return NO_COORD
+
+
 ## Replace or insert a cell at `coord`. The chunk is rebuilt.
 func set_cell(coord: Vector3i, cell: HexCell) -> void:
 	var chunk: HexWorldChunk = _chunk_for_coord(coord)
@@ -405,6 +440,54 @@ func place_overlay(coord: Vector3i, overlay_id: int) -> bool:
 	set_cell(coord, cell)
 	cell_placed.emit(coord)
 	return true
+
+
+## Place an overlay with a specific Y-rotation (0–5, 60° steps).
+## Thin wrapper over `place_overlay()` that also sets `cell.rotation`.
+func place_overlay_rotated(coord: Vector3i, overlay_id: int, rot: int) -> bool:
+	if not place_overlay(coord, overlay_id):
+		return false
+	var cell: HexCell = get_cell(coord)
+	if cell != null:
+		cell.rotation = rot % 6
+		set_cell(coord, cell)
+	return true
+
+
+## Replace an existing overlay (and rotation) in-place. Does NOT check
+## `allowed_on_base` — caller is trusted (used by `HexRoadPlacer` to
+## swap road shapes). Returns false if the cell has no overlay.
+func swap_overlay(coord: Vector3i, new_overlay_id: int, new_rotation: int) -> void:
+	var cell: HexCell = get_cell(coord)
+	if cell == null:
+		return
+	cell.overlay_id = new_overlay_id
+	cell.rotation = new_rotation % 6
+	set_cell(coord, cell)
+
+
+## Scan all loaded chunks and return every coord whose cell carries
+## an overlay with the given `marker`. Returns an empty array when
+## nothing matches. Used by F9 to find existing mine entrances.
+func find_all_markers(marker: StringName) -> Array[Vector3i]:
+	var results: Array[Vector3i] = []
+	if palette == null:
+		return results
+	for cp_v: Variant in _chunks.keys():
+		var chunk: HexWorldChunk = _chunks[cp_v] as HexWorldChunk
+		if chunk == null:
+			continue
+		for local_v: Variant in chunk.cells.keys():
+			var cell: HexCell = chunk.cells[local_v] as HexCell
+			if cell == null or not cell.has_overlay():
+				continue
+			if cell.overlay_id < 0 or cell.overlay_id >= palette.overlays.size():
+				continue
+			var ok: OverlayKind = palette.overlays[cell.overlay_id]
+			if ok != null and ok.marker == marker:
+				var local: Vector3i = local_v as Vector3i
+				results.append(ChunkMath.local_to_cell(local, cp_v as Vector3i, chunk_size_qr, chunk_size_layer))
+	return results
 
 
 # --- lookups -------------------------------------------------------------

@@ -20,6 +20,8 @@ config/features=PackedStringArray("4.3", "Forward Plus")
 GameManager="*res://scripts/global/game_manager.gd"
 InputManager="*res://scripts/global/input_manager.gd"
 Toast="*res://scripts/ui/toast.gd"
+ItemRegistry="*res://scripts/inventory/item_registry.gd"
+RecipeRegistry="*res://scripts/inventory/recipe_registry.gd"
 
 [display]
 

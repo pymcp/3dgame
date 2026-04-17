@@ -8,7 +8,6 @@ signal world_seed_changed(seed_value: int)
 
 var current_state: GameState = GameState.OVERWORLD
 var world_seed: int = 0
-var world: Node3D = null
 
 func _ready() -> void:
 	randomize()
