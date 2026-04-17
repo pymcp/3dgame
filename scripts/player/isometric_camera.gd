@@ -3,11 +3,15 @@ extends Camera3D
 
 @export var target: NodePath
 @export var follow_speed: float = 5.0
-@export var camera_size: float = 2.0
+@export var camera_size: float = 4.8
 @export var offset: Vector3 = Vector3(10, 10, 10)
 
 ## Multiplier applied to player_size to get camera orthographic size.
-## With default player_size 0.0625 and this factor 32, size = 2.0.
+## With default player_size 0.15 and this factor 32, size = 4.8.
+## The character FBX has a built-in ~100× scale from cm units, so a
+## raw `model.scale = player_size` produces a character ≈ 3.76 × size
+## meters tall (0.56 m at size 0.15). The camera size is chosen so the
+## character visually fills ~12% of the view.
 const CAMERA_SIZE_PER_PLAYER_SIZE: float = 32.0
 
 var _target_node: Node3D = null

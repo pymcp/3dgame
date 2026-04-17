@@ -210,7 +210,7 @@ func exit_underground(player: PlayerController) -> void:
 	# is actually the cell the player's feet would occupy.
 	var preferred_coord: Vector3i = _overworld.world_to_coord(preferred)
 	var spawn: Vector3 = _overworld.find_safe_spawn(
-		Vector3i(preferred_coord.x, preferred_coord.y, 1)
+		Vector3i(preferred_coord.x, preferred_coord.y, OverworldHexGenerator.SURFACE_MAX_LAYER + 1)
 	)
 	player.position = spawn
 	player.velocity = Vector3.ZERO

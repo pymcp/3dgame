@@ -13,6 +13,10 @@ const HEX := "res://assets/hex_tiles/"
 static func build_overworld() -> TilePalette:
 	var pal: TilePalette = TilePalette.new()
 
+	var bedrock: TileKind = _base(&"bedrock", "Bedrock", HEX + "stone.glb", 999.0, [])
+	bedrock.tint = Color(0.3, 0.3, 0.32)
+	bedrock.unbreakable = true
+
 	# Base tiles — ids match the strings used in generators / skills.
 	pal.bases = [
 		_base(&"grass", "Grass", HEX + "grass.glb", 1.2, ["dirt_clod"]),
@@ -20,6 +24,7 @@ static func build_overworld() -> TilePalette:
 		_base(&"sand", "Sand", HEX + "sand.glb", 0.8, ["sand"]),
 		_base(&"stone", "Stone", HEX + "stone.glb", 2.0, ["stone"]),
 		_base_water(&"water", "Water", HEX + "water.glb"),
+		bedrock,
 	]
 
 	pal.overlays = [
@@ -28,6 +33,9 @@ static func build_overworld() -> TilePalette:
 		_overlay(&"mountain", "Mountain", HEX + "stone-mountain.glb", 2.5, ["stone"], [&"stone"], true),
 		_overlay(&"rocks_stone", "Rocks", HEX + "stone-rocks.glb", 1.0, ["stone"], [&"stone"], true),
 		_overlay(&"rocks_sand", "Desert Rocks", HEX + "sand-rocks.glb", 1.0, ["stone"], [&"sand"], true),
+		_overlay_ore(&"ore_iron", "Iron Deposit", HEX + "stone-rocks.glb", Color(0.85, 0.65, 0.45), 1.5, ["iron_ore"]),
+		_overlay_ore(&"ore_gold", "Gold Deposit", HEX + "stone-rocks.glb", Color(1.0, 0.85, 0.25), 2.0, ["gold_ore"]),
+		_overlay_ore(&"ore_crystal", "Crystal Deposit", HEX + "stone-rocks.glb", Color(0.55, 0.75, 1.0), 2.5, ["crystal"]),
 		_overlay_mine_entrance(),
 	]
 	return pal

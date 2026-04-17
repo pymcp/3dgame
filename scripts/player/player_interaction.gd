@@ -218,14 +218,9 @@ func _find_facing_cell(world: HexWorld, player_coord: Vector3i, player: PlayerCo
 	)
 	var best: Vector3i = NO_COORD
 	var best_dot: float = 0.3  # ~70° arc threshold
-	# In the mine, allow layer-cycle offset; on the overworld scan only
-	# the player's own layer and one below (terrain + overlays).
+	# Layer-cycle offset applies in both worlds for identical behavior.
 	var layers_to_check: Array[int] = []
-	if player.is_underground:
-		layers_to_check.append(player_coord.z + _wall_layer_offset)
-	else:
-		layers_to_check.append(player_coord.z)
-		layers_to_check.append(player_coord.z - 1)
+	layers_to_check.append(player_coord.z + _wall_layer_offset)
 
 	# Offset -1 = "floor mode": return ONLY the tile directly beneath
 	# the player, skip all adjacent walls.
@@ -443,10 +438,7 @@ func has_target() -> bool:
 
 func _handle_layer_cycle_input() -> void:
 	var player: PlayerController = get_parent() as PlayerController
-	if player == null or not player.is_underground:
-		if _wall_layer_offset != 0:
-			_wall_layer_offset = 0
-			_layer_cycle_active = false
+	if player == null:
 		return
 	# Reset when the player moves to a new hex column (before key
 	# processing so a simultaneous key press overrides the reset).

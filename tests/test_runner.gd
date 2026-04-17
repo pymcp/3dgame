@@ -15,6 +15,8 @@ func _initialize() -> void:
 	_test_hex_grid_axial_roundtrip()
 	_test_palette_lookup()
 	_test_hex_cell_defaults()
+	_test_landmass_shape()
+	_test_overworld_generator_helpers()
 
 	print("")
 	print("Passed: %d   Failed: %d" % [_passed, _failures])
@@ -106,3 +108,41 @@ func _test_hex_cell_defaults() -> void:
 	_assert_eq(c.coord(), Vector3i(3, -2, -4), "coord")
 	c.overlay_id = 2
 	_assert_eq(c.has_overlay(), true, "overlay set")
+
+
+func _test_landmass_shape() -> void:
+	print("-- LandmassShape")
+	var lm: LandmassShape = LandmassShape.new(Vector2.ZERO, 10.0, 10.0, null, 0.0)
+	_assert_eq(lm.is_land(0.0, 0.0), true, "center is land")
+	_assert_eq(lm.is_land(20.0, 0.0), false, "far away is ocean")
+	_assert_eq(lm.land_factor(0.0, 0.0) > 0.9, true, "center factor ~1")
+	_assert_eq(lm.land_factor(10.0, 0.0) <= 0.001, true, "edge factor ~0")
+	_assert_eq(lm.land_factor(20.0, 0.0) < 0.0, true, "outside is negative")
+	# Determinism: same inputs give same outputs.
+	_assert_eq(lm.land_factor(3.0, 4.0), lm.land_factor(3.0, 4.0), "deterministic")
+	_assert_eq(lm.coast_blend(0.0, 0.0), 1.0, "inland blend saturated")
+	_assert_eq(lm.coast_blend(20.0, 0.0), 0.0, "ocean blend = 0")
+
+
+func _test_overworld_generator_helpers() -> void:
+	print("-- OverworldHexGenerator helpers")
+	var gen: OverworldHexGenerator = OverworldHexGenerator.new(42)
+	# Seed it with a landmass so land_factor has somewhere to be positive.
+	gen._ensure_landmasses(16)
+	_assert_eq(gen.is_land(0, 0), true, "origin is land")
+	# Far outside any landmass radius.
+	_assert_eq(gen.is_land(10000, 10000), false, "far coord is ocean")
+	# Determinism: two generators with the same seed agree.
+	var gen2: OverworldHexGenerator = OverworldHexGenerator.new(42)
+	gen2._ensure_landmasses(16)
+	_assert_eq(gen.land_factor(5, 5), gen2.land_factor(5, 5), "seed-determinism land_factor")
+	_assert_eq(gen.surface_layer_at(5, 5), gen2.surface_layer_at(5, 5), "seed-determinism surface_layer")
+	# Surface layer is always within documented bounds.
+	var s: int = gen.surface_layer_at(0, 0)
+	_assert_eq(s >= OverworldHexGenerator.SURFACE_MIN_LAYER, true, "surface >= SURFACE_MIN_LAYER")
+	_assert_eq(s <= OverworldHexGenerator.SURFACE_MAX_LAYER, true, "surface <= SURFACE_MAX_LAYER")
+	# Cliff step is one of 1/2/3.
+	var step: int = gen.cliff_step_at(7, 3)
+	_assert_eq(step >= 1 and step <= 3, true, "cliff_step in [1,3]")
+	# Rivers only carve on land.
+	_assert_eq(gen.is_river_at(10000, 10000), false, "no river in ocean")

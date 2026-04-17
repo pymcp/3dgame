@@ -79,16 +79,18 @@ func _setup_world() -> void:
 	_sun.light_cull_mask = OVERWORLD_CAM_MASK
 	world.add_child(_sun)
 
-	# Safety net so players don't fall forever before chunks stream.
-	# Placed just above the overworld tile top (y = LAYER_HEIGHT) so the
-	# player lands on the same visual height as the streamed tiles.
+	# Safety net so players don't fall forever past the streamed area.
+	# Placed at the same depth as the mine's bedrock layer so a player
+	# who mines a surface tile falls through it and lands at a
+	# consistent "deep ground" height — matching the mine's feel of
+	# hex tiles having real depth.
 	var ground: StaticBody3D = StaticBody3D.new()
 	ground.name = "GroundPlane"
 	ground.collision_layer = OVERWORLD_COLLISION_LAYER
 	var ground_collision: CollisionShape3D = CollisionShape3D.new()
 	var shape: WorldBoundaryShape3D = WorldBoundaryShape3D.new()
 	ground_collision.shape = shape
-	ground_collision.position = Vector3(0, HexGrid.HEX_TILE_HEIGHT, 0)
+	ground_collision.position = Vector3(0, (OverworldHexGenerator.BEDROCK_LAYER - 1) * HexWorldChunk.LAYER_HEIGHT, 0)
 	ground.add_child(ground_collision)
 	world.add_child(ground)
 
@@ -107,6 +109,11 @@ func _setup_worlds() -> void:
 	overworld.name = "Overworld"
 	overworld.render_layer_bit = OVERWORLD_RENDER_BIT
 	overworld.collision_layer = OVERWORLD_COLLISION_LAYER
+	# Overworld surface ranges from layer -3 (seabed) to +9 (mountains),
+	# with bedrock at -20. Bump vertical stream radius so the surface is
+	# fully covered whenever the player is near it.
+	overworld.load_radius_layer = 3
+	overworld.unload_radius_layer = 4
 	world.add_child(overworld)
 	var ow_palette: TilePalette = DefaultPalettes.build_overworld()
 	var ow_gen: OverworldHexGenerator = OverworldHexGenerator.new(GameManager.world_seed)
@@ -135,9 +142,12 @@ func _setup_players() -> void:
 	overworld.prime_around(Vector3.ZERO, 2, 0)   # load_radius_qr + 2 rings
 	# Resolve initial spawn positions through the same safe-spawn API
 	# used for transitions, so launch-time spawn points don't land
-	# inside water / blocking overlays / unstreamed air.
-	var p1_spawn: Vector3 = overworld.find_safe_spawn(Vector3i(0, 0, 1))
-	var p2_spawn: Vector3 = overworld.find_safe_spawn(Vector3i(3, 0, 1))
+	# inside water / blocking overlays / unstreamed air. Start the
+	# search well above the tallest possible surface so the down-scan
+	# lands on the real surface layer.
+	var top: int = OverworldHexGenerator.SURFACE_MAX_LAYER + 1
+	var p1_spawn: Vector3 = overworld.find_safe_spawn(Vector3i(0, 0, top))
+	var p2_spawn: Vector3 = overworld.find_safe_spawn(Vector3i(3, 0, top))
 	player1 = PlayerFactory.build(1, skins[0], p1_spawn)
 	player2 = PlayerFactory.build(2, skins[1], p2_spawn)
 	world.add_child(player1)
@@ -365,10 +375,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			_magic_drop_mine_entrance()
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_PAGEUP:
-			_change_player_size(0.005)
+			_change_player_size(0.1)
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_PAGEDOWN:
-			_change_player_size(-0.005)
+			_change_player_size(-0.1)
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_HOME:
 			_change_overlay_scale(0.1)
@@ -383,7 +393,7 @@ func _unhandled_input(event: InputEvent) -> void:
 func _change_player_size(delta: float) -> void:
 	if player1 == null:
 		return
-	var new_size: float = clampf(player1.player_size + delta, 0.005, 1.0)
+	var new_size: float = clampf(player1.player_size + delta, 0.1, 4.0)
 	player1.set_player_size(new_size)
 	player2.set_player_size(new_size)
 	camera1.set_zoom_from_player_size(new_size)
