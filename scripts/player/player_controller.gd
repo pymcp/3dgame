@@ -2,9 +2,9 @@ class_name PlayerController
 extends CharacterBody3D
 
 @export var player_id: int = 1
-## Runtime-overridden by `_apply_player_size()` to `0.6 + player_size * 1.5`.
-## Default here matches the default `player_size = 0.15` (= 0.825).
-@export var move_speed: float = 0.825
+## Runtime-overridden by `_apply_player_size()` to `0.6 + player_size * 20.0`.
+## Default here matches the default `player_size = 0.15` (= 3.6).
+@export var move_speed: float = 3.6
 @export var gravity: float = 20.0
 @export var skin_name: String = ""
 ## Character scale. Changing this at runtime via `set_player_size()`
@@ -248,7 +248,7 @@ func _apply_render_layers_recursive(node: Node, layers_bitmask: int) -> void:
 ## Update the character scale at runtime. Rescales the model, the
 ## collision capsule, and `move_speed` consistently.
 func set_player_size(new_size: float) -> void:
-	player_size = clampf(new_size, 0.1, 4.0)
+	player_size = clampf(new_size, 0.005, 1.0)
 	_apply_player_size()
 
 
@@ -263,8 +263,8 @@ func _apply_player_size() -> void:
 		model.scale = Vector3(player_size, player_size, player_size)
 
 	# Movement speed: linear with a floor so tiny characters aren't
-	# painfully slow. size=0.15 → 0.825, size=1.0 → 2.1, size=2.0 → 3.6.
-	move_speed = 0.6 + player_size * 1.5
+	# painfully slow. size=0.0625 → 1.85, size=0.15 → 3.6, size=0.25 → 5.6.
+	move_speed = 0.6 + player_size * 20.0
 
 	# Collision capsule: radius 0.6×size, height 2.0×size, centered
 	# at Y=size (capsule origin is at its center).

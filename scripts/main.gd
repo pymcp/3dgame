@@ -375,10 +375,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			_magic_drop_mine_entrance()
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_PAGEUP:
-			_change_player_size(0.1)
+			_change_player_size(0.005)
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_PAGEDOWN:
-			_change_player_size(-0.1)
+			_change_player_size(-0.005)
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_HOME:
 			_change_overlay_scale(0.1)
@@ -393,7 +393,7 @@ func _unhandled_input(event: InputEvent) -> void:
 func _change_player_size(delta: float) -> void:
 	if player1 == null:
 		return
-	var new_size: float = clampf(player1.player_size + delta, 0.1, 4.0)
+	var new_size: float = clampf(player1.player_size + delta, 0.005, 1.0)
 	player1.set_player_size(new_size)
 	player2.set_player_size(new_size)
 	camera1.set_zoom_from_player_size(new_size)
