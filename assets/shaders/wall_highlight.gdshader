@@ -1,33 +1,29 @@
 shader_type spatial;
-render_mode unshaded, cull_disabled, depth_draw_never;
+render_mode unshaded, cull_disabled, depth_draw_never, depth_test_disabled;
 
 uniform vec4 highlight_color : source_color = vec4(1.0, 0.95, 0.2, 0.85);
 uniform float pulse_time : hint_range(0.0, 100000.0) = 0.0;
 uniform float pulse_speed : hint_range(0.0, 10.0) = 4.0;
 uniform float pulse_amount : hint_range(0.0, 1.0) = 0.15;
-uniform float hex_radius : hint_range(0.0, 1.0) = 0.80;
-uniform float ring_width : hint_range(0.01, 0.5) = 0.08;
-uniform float edge_softness : hint_range(0.001, 0.1) = 0.025;
-uniform float glow_width : hint_range(0.0, 0.3) = 0.06;
+uniform float border_width : hint_range(0.01, 0.6) = 0.18;
+uniform float edge_softness : hint_range(0.001, 0.15) = 0.04;
+uniform float glow_width : hint_range(0.0, 0.4) = 0.10;
+uniform float corner_radius : hint_range(0.0, 0.5) = 0.08;
 
-// Pointy-top hexagon signed distance field.
-// IQ's SDF is flat-top; swapping p.xy → p.yx rotates it to pointy-top
-// so vertices point along the V axis (world Z on PlaneMesh).
-float hex_sdf(vec2 p, float r) {
-	const vec3 k = vec3(-0.866025404, 0.5, 0.577350269);
-	p = abs(p.yx);
-	p -= 2.0 * min(dot(k.xy, p), 0.0) * k.xy;
-	p -= vec2(clamp(p.x, -k.z * r, k.z * r), r);
-	return length(p) * sign(p.y);
+// Rounded-rectangle signed distance field.
+float rounded_rect_sdf(vec2 p, vec2 b, float r) {
+	vec2 q = abs(p) - b + vec2(r);
+	return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - r;
 }
 
 void fragment() {
 	vec2 p = UV * 2.0 - 1.0;
 
-	float d_outer = hex_sdf(p, hex_radius);
-	float d_inner = hex_sdf(p, hex_radius - ring_width);
+	float d_outer = rounded_rect_sdf(p, vec2(1.0, 1.0), corner_radius);
+	float inner_r = max(corner_radius - border_width, 0.0);
+	float d_inner = rounded_rect_sdf(p, vec2(1.0 - border_width, 1.0 - border_width), inner_r);
 
-	// Ring mask: inside outer hex AND outside inner hex.
+	// Ring mask: inside outer rect AND outside inner rect.
 	float outer_mask = 1.0 - smoothstep(-edge_softness, edge_softness, d_outer);
 	float inner_mask = smoothstep(-edge_softness, edge_softness, d_inner);
 	float ring = outer_mask * inner_mask;

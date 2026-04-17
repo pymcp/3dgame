@@ -370,6 +370,12 @@ func _unhandled_input(event: InputEvent) -> void:
 		elif key.keycode == KEY_PAGEDOWN:
 			_change_player_size(-0.005)
 			get_viewport().set_input_as_handled()
+		elif key.keycode == KEY_HOME:
+			_change_overlay_scale(0.1)
+			get_viewport().set_input_as_handled()
+		elif key.keycode == KEY_END:
+			_change_overlay_scale(-0.1)
+			get_viewport().set_input_as_handled()
 
 
 ## Debug: adjust both players' size (and camera zoom) by `delta`, then
@@ -383,6 +389,16 @@ func _change_player_size(delta: float) -> void:
 	camera1.set_zoom_from_player_size(new_size)
 	camera2.set_zoom_from_player_size(new_size)
 	Toast.push("Scale: %.3f" % new_size)
+
+
+## Debug: adjust the global overlay scale multiplier (trees, rocks,
+## ores — base tiles unaffected) by `delta` and rebuild visuals on both
+## worlds. Bound to Home / End.
+func _change_overlay_scale(delta: float) -> void:
+	var new_scale: float = clampf(HexWorldChunk.overlay_scale_multiplier + delta, 0.1, 8.0)
+	overworld.set_overlay_scale(new_scale)
+	mine.set_overlay_scale(new_scale)
+	Toast.push("Overlay scale: %.2f" % new_scale)
 
 
 ## Debug: drop a mine-entrance overlay from the sky onto an overworld

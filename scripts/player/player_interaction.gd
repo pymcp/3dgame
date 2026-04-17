@@ -17,6 +17,8 @@ const HIGHLIGHT_COLOR_INTERACT: Color = Color(0.2, 1.0, 0.4, 0.9)
 const NO_COORD: Vector3i = Vector3i(-99999, -99999, -99999)
 
 const _HIGHLIGHT_SHADER_PATH: String = "res://assets/shaders/hex_highlight.gdshader"
+const _WALL_HIGHLIGHT_SHADER_PATH: String = "res://assets/shaders/wall_highlight.gdshader"
+const _MAX_WALL_OFFSET: int = 4  # upper bound for layer cycle
 
 var camera: Camera3D = null
 var viewport: SubViewport = null
@@ -33,6 +35,8 @@ var _highlight_base_color: Color = HIGHLIGHT_COLOR_DEFAULT
 
 var _highlight: MeshInstance3D = null
 var _highlight_shader_mat: ShaderMaterial = null
+var _wall_highlight: MeshInstance3D = null
+var _wall_highlight_shader_mat: ShaderMaterial = null
 var _crack_overlay: CrackOverlay = null
 var _mining_vfx: MiningVFX = null
 
@@ -40,6 +44,7 @@ var _mining_vfx: MiningVFX = null
 var _wall_layer_offset: int = 0
 var _last_wall_qr: Vector2i = Vector2i(-99999, -99999)
 var _wall_targeting_active: bool = false
+var _is_wall_target: bool = false
 
 
 func set_camera(cam: Camera3D) -> void:
@@ -66,8 +71,10 @@ func _ensure_widgets() -> void:
 	if _highlight != null:
 		return
 	_create_highlight()
+	_create_wall_highlight()
 	_crack_overlay = CrackOverlay.new()
 	_crack_overlay.name = "CrackOverlay"
+	_crack_overlay.top_level = true
 	add_child(_crack_overlay)
 	_mining_vfx = MiningVFX.new()
 	_mining_vfx.name = "MiningVFX"
@@ -92,7 +99,26 @@ func _create_highlight() -> void:
 	_highlight_shader_mat.render_priority = 1
 	_highlight.material_override = _highlight_shader_mat
 	_highlight.visible = false
+	_highlight.top_level = true
 	add_child(_highlight)
+
+
+func _create_wall_highlight() -> void:
+	_wall_highlight = MeshInstance3D.new()
+	var plane: PlaneMesh = PlaneMesh.new()
+	# Slightly oversized so the border/glow covers the wall face edges.
+	plane.size = Vector2(HexGrid.HEX_SIZE * 1.15, HexWorldChunk.LAYER_HEIGHT * 1.4)
+	_wall_highlight.mesh = plane
+	var shader: Shader = load(_WALL_HIGHLIGHT_SHADER_PATH) as Shader
+	_wall_highlight_shader_mat = ShaderMaterial.new()
+	_wall_highlight_shader_mat.shader = shader
+	_wall_highlight_shader_mat.set_shader_parameter("highlight_color", HIGHLIGHT_COLOR_DEFAULT)
+	_wall_highlight_shader_mat.set_shader_parameter("pulse_time", 0.0)
+	_wall_highlight_shader_mat.render_priority = 1
+	_wall_highlight.material_override = _wall_highlight_shader_mat
+	_wall_highlight.visible = false
+	_wall_highlight.top_level = true
+	add_child(_wall_highlight)
 
 
 func _process(delta: float) -> void:
@@ -192,15 +218,23 @@ func _find_facing_cell(world: HexWorld, player_coord: Vector3i, player: PlayerCo
 	else:
 		layers_to_check.append(player_coord.z)
 		layers_to_check.append(player_coord.z - 1)
+	# When offset is negative (looking down), also consider the tile
+	# directly under the player (dq=0, dr=0).
+	var allow_self_column: bool = _wall_layer_offset < 0
 	for target_layer: int in layers_to_check:
 		for dq: int in range(-1, 2):
 			for dr: int in range(-1, 2):
-				if dq == 0 and dr == 0:
+				if dq == 0 and dr == 0 and not allow_self_column:
 					continue
 				if HexGrid.axial_distance(Vector2i(0, 0), Vector2i(dq, dr)) > 1:
 					continue
 				var c: Vector3i = Vector3i(player_coord.x + dq, player_coord.y + dr, target_layer)
 				if not world.has_cell(c):
+					continue
+				# Self-column (directly below): always valid when looking down.
+				if dq == 0 and dr == 0:
+					best = c
+					best_dot = 2.0  # Guaranteed winner.
 					continue
 				var xz: Vector3 = HexGrid.axial_to_world(dq, dr)
 				var cell_dir: Vector2 = Vector2(xz.x, xz.z).normalized()
@@ -251,12 +285,50 @@ func _do_raycast(world: HexWorld) -> Vector3i:
 
 
 func _set_target_coord(world: HexWorld, coord: Vector3i, is_interactable: bool) -> void:
-	if coord != _targeted_coord:
+	# Determine whether this is a wall face or a floor/top target.
+	# Same-column targets (floor beneath player) use the flat hex ring.
+	var player: PlayerController = get_parent() as PlayerController
+	var is_same_column: bool = false
+	if player:
+		var pc: Vector3i = world.world_to_coord(player.global_position)
+		is_same_column = (coord.x == pc.x and coord.y == pc.y)
+	var wall_mode: bool = _wall_targeting_active and not is_interactable and not is_same_column
+	if coord != _targeted_coord or wall_mode != _is_wall_target:
 		_targeted_coord = coord
+		_is_wall_target = wall_mode
 		var cell_origin: Vector3 = world.coord_to_world(coord)
-		# Place flat ring just above the top surface of the tile.
-		_highlight.global_position = cell_origin + Vector3(0.0, HexWorldChunk.LAYER_HEIGHT + 0.005, 0.0)
-		_highlight.visible = true
+
+		if wall_mode and _wall_highlight != null:
+			# Position the wall highlight on the face between player and target.
+			if player:
+				var player_coord: Vector3i = world.world_to_coord(player.global_position)
+				var target_xz: Vector3 = HexGrid.axial_to_world(coord.x, coord.y)
+				var player_xz: Vector3 = HexGrid.axial_to_world(player_coord.x, player_coord.y)
+				var mid_xz: Vector3 = (target_xz + player_xz) * 0.5
+				var wall_y: float = cell_origin.y + HexWorldChunk.LAYER_HEIGHT * 0.5
+				_wall_highlight.global_position = Vector3(mid_xz.x, wall_y, mid_xz.z)
+				# Orient the PlaneMesh vertically: local X → wall-right,
+				# local Y → toward player (normal), local Z → world UP.
+				var to_player: Vector3 = player_xz - target_xz
+				to_player.y = 0.0
+				if to_player.length_squared() > 0.001:
+					to_player = to_player.normalized()
+					var wall_right: Vector3 = to_player.cross(Vector3.UP).normalized()
+					_wall_highlight.global_basis = Basis(wall_right, to_player, Vector3.UP)
+			_wall_highlight.visible = true
+			_highlight.visible = false
+		else:
+			# Flat ring position depends on whether the target is directly
+			# beneath the player. Place it at the bottom of that cell so
+			# it doesn't render on top of the player model.
+			var y_off: float = HexWorldChunk.LAYER_HEIGHT + 0.005
+			if is_same_column:
+				y_off = 0.005  # just above the cell's bottom face
+			_highlight.global_position = cell_origin + Vector3(0.0, y_off, 0.0)
+			_highlight.visible = true
+			if _wall_highlight:
+				_wall_highlight.visible = false
+
 		_crack_overlay.global_position = cell_origin + Vector3(0.0, HexWorldChunk.LAYER_HEIGHT * 0.5, 0.0)
 		if is_interactable:
 			_highlight_base_color = HIGHLIGHT_COLOR_INTERACT
@@ -271,8 +343,11 @@ func _clear_target() -> void:
 	if _targeted_coord == NO_COORD:
 		return
 	_targeted_coord = NO_COORD
+	_is_wall_target = false
 	if _highlight:
 		_highlight.visible = false
+	if _wall_highlight:
+		_wall_highlight.visible = false
 	if _crack_overlay:
 		_crack_overlay.reset()
 	_highlight_base_color = HIGHLIGHT_COLOR_DEFAULT
@@ -365,20 +440,30 @@ func _handle_layer_cycle_input() -> void:
 			_wall_layer_offset = 0
 		return
 	if InputManager.is_action_just_pressed(player_id, "target_up"):
-		_wall_layer_offset += 1
+		if _wall_layer_offset >= _MAX_WALL_OFFSET:
+			_wall_layer_offset = -1  # wrap to floor
+		else:
+			_wall_layer_offset += 1
 	elif InputManager.is_action_just_pressed(player_id, "target_down"):
-		_wall_layer_offset -= 1
+		if _wall_layer_offset <= -1:
+			_wall_layer_offset = _MAX_WALL_OFFSET  # wrap to top
+		else:
+			_wall_layer_offset -= 1
 
 
 func _update_highlight_pulse(delta: float) -> void:
-	if _highlight == null or _highlight_shader_mat == null:
+	if _highlight_shader_mat == null:
 		return
-	if not _highlight.visible:
+	var any_visible: bool = (_highlight != null and _highlight.visible) or (_wall_highlight != null and _wall_highlight.visible)
+	if not any_visible:
 		_highlight_time = 0.0
 		return
 	_highlight_time += delta
 	_highlight_shader_mat.set_shader_parameter("highlight_color", _highlight_base_color)
 	_highlight_shader_mat.set_shader_parameter("pulse_time", _highlight_time)
+	if _wall_highlight_shader_mat:
+		_wall_highlight_shader_mat.set_shader_parameter("highlight_color", _highlight_base_color)
+		_wall_highlight_shader_mat.set_shader_parameter("pulse_time", _highlight_time)
 
 
 func _sync_widget_render_layers() -> void:
@@ -390,6 +475,8 @@ func _sync_widget_render_layers() -> void:
 	var bitmask: int = 2 if not player.is_underground else 4
 	if _highlight:
 		_highlight.layers = bitmask
+	if _wall_highlight:
+		_wall_highlight.layers = bitmask
 	if _crack_overlay:
 		_crack_overlay.layers = bitmask
 	if _mining_vfx:

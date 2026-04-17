@@ -7,6 +7,11 @@ extends Node3D
 
 const LAYER_HEIGHT: float = HexGrid.HEX_TILE_HEIGHT  # world-units per layer step
 
+## Global multiplier applied to overlay MultiMesh instance transforms
+## (trees, rocks, ores, hills, mountains). Base tiles are not affected.
+## Adjusted at runtime via `HexWorld.set_overlay_scale(...)`.
+static var overlay_scale_multiplier: float = 1.0
+
 var chunk_pos: Vector3i = Vector3i.ZERO
 var size_qr: int = 16
 var size_layer: int = 4
@@ -187,7 +192,7 @@ func _write_base_mmis(by_base: Dictionary) -> void:
 			continue
 		var locals: Array = by_base[base_id] as Array
 		var mmi: MultiMeshInstance3D = _get_or_make_mmi(_base_mmis, base_id, tk.mesh)
-		_write_mmi(mmi, locals, tk.tint, 0.0)
+		_write_mmi(mmi, locals, tk.tint, 0.0, 1.0)
 
 
 func _write_overlay_mmis(by_overlay: Dictionary) -> void:
@@ -205,8 +210,8 @@ func _write_overlay_mmis(by_overlay: Dictionary) -> void:
 			continue
 		var locals: Array = by_overlay[ov_id] as Array
 		var mmi: MultiMeshInstance3D = _get_or_make_mmi(_overlay_mmis, ov_id, ok.mesh)
-		# Overlay extra y offset.
-		_write_mmi(mmi, locals, ok.tint, ok.y_offset)
+		# Overlay extra y offset + global overlay scale multiplier.
+		_write_mmi(mmi, locals, ok.tint, ok.y_offset, overlay_scale_multiplier)
 
 
 func _get_or_make_mmi(cache: Dictionary, key: int, mesh: Mesh) -> MultiMeshInstance3D:
@@ -227,7 +232,7 @@ func _get_or_make_mmi(cache: Dictionary, key: int, mesh: Mesh) -> MultiMeshInsta
 	return new_mmi
 
 
-func _write_mmi(mmi: MultiMeshInstance3D, locals: Array, tint: Color, y_offset: float) -> void:
+func _write_mmi(mmi: MultiMeshInstance3D, locals: Array, tint: Color, y_offset: float, scale: float) -> void:
 	var count: int = locals.size()
 	var mm: MultiMesh = mmi.multimesh
 	mm.instance_count = count
@@ -241,10 +246,10 @@ func _write_mmi(mmi: MultiMeshInstance3D, locals: Array, tint: Color, y_offset: 
 		var cell: HexCell = cells[local] as HexCell
 		var pos: Vector3 = _cell_world_center(cell) + Vector3(0.0, y_offset, 0.0)
 		var offset: int = i * 16
-		# Identity basis rows (3x4 layout: basis.x, basis.y, basis.z, origin).
-		buf[offset + 0] = 1.0; buf[offset + 1] = 0.0; buf[offset + 2] = 0.0; buf[offset + 3] = pos.x
-		buf[offset + 4] = 0.0; buf[offset + 5] = 1.0; buf[offset + 6] = 0.0; buf[offset + 7] = pos.y
-		buf[offset + 8] = 0.0; buf[offset + 9] = 0.0; buf[offset + 10] = 1.0; buf[offset + 11] = pos.z
+		# Uniform-scaled basis rows (3x4 layout: basis.x, basis.y, basis.z, origin).
+		buf[offset + 0] = scale; buf[offset + 1] = 0.0;   buf[offset + 2] = 0.0;   buf[offset + 3] = pos.x
+		buf[offset + 4] = 0.0;   buf[offset + 5] = scale; buf[offset + 6] = 0.0;   buf[offset + 7] = pos.y
+		buf[offset + 8] = 0.0;   buf[offset + 9] = 0.0;   buf[offset + 10] = scale; buf[offset + 11] = pos.z
 		buf[offset + 12] = tint.r; buf[offset + 13] = tint.g; buf[offset + 14] = tint.b; buf[offset + 15] = tint.a
 	mm.buffer = buf
 

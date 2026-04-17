@@ -56,6 +56,17 @@ func set_active_players(players: Array[Node3D]) -> void:
 	_active_players = players
 
 
+## Update the global overlay scale multiplier (trees, rocks, ores) and
+## rebuild visuals on all loaded chunks so the change shows immediately.
+## This is a global static — calling on one `HexWorld` affects all worlds.
+func set_overlay_scale(new_scale: float) -> void:
+	HexWorldChunk.overlay_scale_multiplier = new_scale
+	for cp_v: Variant in _chunks.keys():
+		var chunk: HexWorldChunk = _chunks[cp_v] as HexWorldChunk
+		if is_instance_valid(chunk):
+			chunk.rebuild_visuals()
+
+
 func _process(delta: float) -> void:
 	_update_timer += delta
 	if _update_timer >= chunk_update_interval:
