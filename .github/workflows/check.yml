@@ -1,0 +1,42 @@
+name: check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  parse:
+    name: GDScript parse + smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Godot
+        id: cache-godot
+        uses: actions/cache@v4
+        with:
+          path: godot-bin
+          key: godot-4.3-stable-linux
+
+      - name: Download Godot 4.3 (headless)
+        if: steps.cache-godot.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p godot-bin
+          curl -L -o godot-bin/godot.zip \
+            https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip
+          unzip -o godot-bin/godot.zip -d godot-bin
+          mv godot-bin/Godot_v4.3-stable_linux.x86_64 godot-bin/godot
+          chmod +x godot-bin/godot
+
+      - name: Import project (generates .import metadata)
+        run: |
+          ./godot-bin/godot --headless --path . --import || true
+
+      - name: Parse-check
+        run: |
+          ./godot-bin/godot --headless --path . --check-only --quit
+
+      - name: Smoke tests
+        run: |
+          ./godot-bin/godot --headless --path . --script res://tests/test_runner.gd
