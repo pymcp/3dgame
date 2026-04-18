@@ -6,6 +6,13 @@ extends RefCounted
 ## removed when chunks unload. Mining / placement edits incrementally
 ## update the affected columns.
 ##
+## **Deferred updates**: chunk-loaded events queue cells for processing
+## rather than registering thousands of points synchronously inside one
+## frame. Cell-changed events are coalesced too. Call `process_pending`
+## from the owning system (a `Node` ticking each frame) with a budget
+## to drain the work over multiple frames. This eliminates the multi-
+## hundred-ms hitch on mine entry / fast travel.
+##
 ## Walkable rule (matches `HexWorld._column_is_safe`):
 ##   * `coord` cell is air (no base), AND
 ##   * cell at `coord - layer_unit` exists with a base, AND
@@ -20,11 +27,25 @@ extends RefCounted
 
 const _OFFSET: int = 32768  # so q/r/layer in [-32768, 32767] pack uniquely
 
+## Default per-frame budget for `process_pending`. Bumped fairly high
+## because each unit of work is just an add_point + connect_points,
+## but kept bounded so chunk floods don't cause hitches.
+const DEFAULT_BUDGET_PER_FRAME: int = 256
+
 
 var hex_world: HexWorld
 var astar: AStar3D
 ## Coords (Vector3i) that have been registered as walkable AStar points.
 var _walkable: Dictionary = {}  # Vector3i -> int (point id)
+
+# --- deferred work queues ------------------------------------------------
+#
+# When chunks load we defer the per-cell scan; when cells are mined or
+# placed we defer the per-coord refresh. `process_pending` (called by
+# `CreatureSpawner._process` once per frame) drains these.
+var _pending_chunks: Array[Vector3i] = []   # chunks we still need to scan
+var _pending_chunks_set: Dictionary = {}    # dedup
+var _pending_refresh: Dictionary = {}       # Vector3i coord -> true
 
 
 func _init(world: HexWorld) -> void:
@@ -47,9 +68,32 @@ func _init(world: HexWorld) -> void:
 func is_walkable(coord: Vector3i) -> bool:
 	if hex_world == null or hex_world.palette == null:
 		return false
-	if hex_world.get_cell(coord) != null:
+	# Resolve both cells through the same chunk when possible — the
+	# standing cell (coord) and the floor cell (coord - layer_unit)
+	# share the same (q, r) column, so they live in the same chunk
+	# unless `coord.z` straddles a chunk boundary.
+	var size_qr: int = hex_world.chunk_size_qr
+	var size_layer: int = hex_world.chunk_size_layer
+	var stand_cp: Vector3i = ChunkMath.cell_to_chunk(coord, size_qr, size_layer)
+	var stand_chunk: HexWorldChunk = hex_world._chunks.get(stand_cp) as HexWorldChunk
+	if stand_chunk == null:
 		return false
-	var below: HexCell = hex_world.get_cell(Vector3i(coord.x, coord.y, coord.z - 1))
+	# The standing cell must be empty (no solid base to be trapped in).
+	if stand_chunk.get_cell_local(
+			ChunkMath.cell_to_local(coord, stand_cp, size_qr, size_layer)) != null:
+		return false
+	# The cell below must exist (floor) and not carry a blocking overlay.
+	var floor_coord: Vector3i = Vector3i(coord.x, coord.y, coord.z - 1)
+	var floor_cp: Vector3i = stand_cp
+	if (coord.z - 1) < stand_cp.z * size_layer:
+		# Crossed a chunk boundary downward — look up the chunk below.
+		floor_cp = ChunkMath.cell_to_chunk(floor_coord, size_qr, size_layer)
+	var floor_chunk: HexWorldChunk = stand_chunk if floor_cp == stand_cp \
+			else hex_world._chunks.get(floor_cp) as HexWorldChunk
+	if floor_chunk == null:
+		return false
+	var below: HexCell = floor_chunk.get_cell_local(
+			ChunkMath.cell_to_local(floor_coord, floor_cp, size_qr, size_layer))
 	if below == null:
 		return false
 	if below.has_overlay():
@@ -101,33 +145,105 @@ func walkable_count() -> int:
 	return _walkable.size()
 
 
+## Drain pending chunk scans + cell refreshes up to `budget` units of
+## work. Must be called every frame (e.g. from CreatureSpawner._process)
+## to keep the graph in sync without large hitches.
+##
+## Returns the number of "work units" performed (rough proxy for cost):
+##   - 1 unit per cell processed during chunk scan
+##   - 1 unit per refreshed coord
+func process_pending(budget: int = DEFAULT_BUDGET_PER_FRAME) -> int:
+	var spent: int = 0
+	# 1) refresh changed cells (coalesced from multiple cell-changed events)
+	if not _pending_refresh.is_empty():
+		var to_clear: Array[Vector3i] = []
+		for c_v: Variant in _pending_refresh.keys():
+			if spent >= budget:
+				break
+			var c: Vector3i = c_v as Vector3i
+			_refresh_point(c)
+			to_clear.append(c)
+			spent += 1
+		for c: Vector3i in to_clear:
+			_pending_refresh.erase(c)
+	# 2) drain queued chunk scans (most expensive — each cell is one unit)
+	while not _pending_chunks.is_empty() and spent < budget:
+		var cp: Vector3i = _pending_chunks[0]
+		var consumed: int = _scan_chunk_partial(cp, budget - spent)
+		spent += consumed
+		# `_scan_chunk_partial` returns -1 when the chunk is complete.
+		if consumed < 0:
+			_pending_chunks.pop_front()
+			_pending_chunks_set.erase(cp)
+	return spent
+
+
 # --- chunk events --------------------------------------------------------
 
+## Per-chunk scan progress: chunk_pos -> next local index to process.
+## Lets us split a big chunk's add-points work over multiple frames.
+var _scan_progress: Dictionary = {}  # Vector3i -> int
+## Per-chunk cached keys snapshot so a multi-frame scan doesn't rebuild
+## the keys Array every frame (significant for 1024-cell chunks).
+var _scan_keys: Dictionary = {}      # Vector3i -> Array
+
+
 func _on_chunk_loaded(chunk_pos: Vector3i) -> void:
+	if _pending_chunks_set.has(chunk_pos):
+		return
+	_pending_chunks.append(chunk_pos)
+	_pending_chunks_set[chunk_pos] = true
+	_scan_progress[chunk_pos] = 0
+
+
+## Process up to `budget` cells of the chunk's keys. Returns either
+## the number of cells consumed (>= 0) if work remains, or `-1` when
+## the entire chunk has been scanned + caller should pop it.
+func _scan_chunk_partial(chunk_pos: Vector3i, budget: int) -> int:
 	var chunk: HexWorldChunk = hex_world.get_chunk(chunk_pos)
 	if chunk == null:
-		return
-	# Walk every solid cell in the chunk and register the air column
-	# directly above as walkable. This naturally captures surface tops
-	# without scanning the (mostly empty) air space.
+		return -1
 	var size_qr: int = hex_world.chunk_size_qr
 	var size_layer: int = hex_world.chunk_size_layer
+	var keys_v: Variant = _scan_keys.get(chunk_pos)
+	var keys: Array
+	if keys_v == null:
+		keys = chunk.cells.keys()
+		_scan_keys[chunk_pos] = keys
+	else:
+		keys = keys_v
+	var start: int = _scan_progress.get(chunk_pos, 0)
+	var end_excl: int = mini(start + budget, keys.size())
 	var added: Array[Vector3i] = []
-	for local_v: Variant in chunk.cells.keys():
-		var local: Vector3i = local_v as Vector3i
+	for i: int in range(start, end_excl):
+		var local: Vector3i = keys[i] as Vector3i
 		var coord: Vector3i = ChunkMath.local_to_cell(local, chunk_pos, size_qr, size_layer)
 		var stand: Vector3i = Vector3i(coord.x, coord.y, coord.z + 1)
 		if is_walkable(stand) and not _walkable.has(stand):
 			_add_point(stand)
 			added.append(stand)
-	# Connect newly added points to any existing neighbors.
+	# Connect newly added points to existing neighbors (cheap dict checks).
 	for c: Vector3i in added:
 		_connect_neighbors(c)
+	if end_excl >= keys.size():
+		_scan_progress.erase(chunk_pos)
+		_scan_keys.erase(chunk_pos)
+		return -1
+	_scan_progress[chunk_pos] = end_excl
+	return end_excl - start
 
 
 func _on_chunk_unloaded(chunk_pos: Vector3i) -> void:
+	# Cancel any pending scan for this chunk.
+	_pending_chunks_set.erase(chunk_pos)
+	_scan_progress.erase(chunk_pos)
+	_scan_keys.erase(chunk_pos)
+	for i: int in range(_pending_chunks.size() - 1, -1, -1):
+		if _pending_chunks[i] == chunk_pos:
+			_pending_chunks.remove_at(i)
 	# Remove any walkable points whose floor or own coord lives in the
-	# unloaded chunk.
+	# unloaded chunk. (This is fast — bounded by the points we own,
+	# not by every loaded chunk.)
 	var size_qr: int = hex_world.chunk_size_qr
 	var size_layer: int = hex_world.chunk_size_layer
 	var to_remove: Array[Vector3i] = []
@@ -144,22 +260,17 @@ func _on_chunk_unloaded(chunk_pos: Vector3i) -> void:
 
 
 func _on_cell_changed(coord: Vector3i, _a: int = 0, _b: int = 0, _c: bool = false) -> void:
-	# Re-evaluate the cell itself and its immediate vertical neighbors:
-	# mining the floor below a walkable point invalidates that point;
-	# mining the cell at a walkable point may now expose air above.
-	var to_check: Array[Vector3i] = [
-		coord,
-		Vector3i(coord.x, coord.y, coord.z + 1),
-		Vector3i(coord.x, coord.y, coord.z - 1),
-	]
-	# Also re-check neighbors at ±1 layer because slopes may have changed.
+	# Coalesce: stash the affected coords; `process_pending` refreshes
+	# them next frame. Multiple mines on the same cluster get collapsed
+	# into one refresh per coord.
+	_pending_refresh[coord] = true
+	_pending_refresh[Vector3i(coord.x, coord.y, coord.z + 1)] = true
+	_pending_refresh[Vector3i(coord.x, coord.y, coord.z - 1)] = true
 	for dir: Vector2i in HexGrid.AXIAL_DIRECTIONS:
 		var nq: int = coord.x + dir.x
 		var nr: int = coord.y + dir.y
-		to_check.append(Vector3i(nq, nr, coord.z))
-		to_check.append(Vector3i(nq, nr, coord.z + 1))
-	for c: Vector3i in to_check:
-		_refresh_point(c)
+		_pending_refresh[Vector3i(nq, nr, coord.z)] = true
+		_pending_refresh[Vector3i(nq, nr, coord.z + 1)] = true
 
 
 # --- internal graph maintenance ------------------------------------------
@@ -200,10 +311,12 @@ func _connect_neighbors(coord: Vector3i) -> void:
 		# Connect at ±0 and ±1 layer — creatures can step up/down 1 layer.
 		for dz: int in [0, 1, -1]:
 			var n: Vector3i = Vector3i(nq, nr, coord.z + dz)
-			if _walkable.has(n):
-				var to_id: int = _walkable[n]
-				if not astar.are_points_connected(from_id, to_id):
-					astar.connect_points(from_id, to_id, true)
+			var to_id_v: Variant = _walkable.get(n)
+			if to_id_v != null:
+				# `connect_points` is idempotent on bidirectional pairs;
+				# skip the `are_points_connected` check (which is itself
+				# a hashmap lookup pair).
+				astar.connect_points(from_id, to_id_v as int, true)
 
 
 func _nearest_known_id(coord: Vector3i) -> int:

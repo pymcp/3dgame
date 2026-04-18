@@ -41,7 +41,20 @@ func _init(c: Vector2 = Vector2.ZERO,
 func land_factor(q: float, r: float) -> float:
 	var dq: float = (q - center.x) / radius_q
 	var dr: float = (r - center.y) / radius_r
-	var dist: float = sqrt(dq * dq + dr * dr)
+	var d2: float = dq * dq + dr * dr
+	# Fast-path: deep ocean columns dominate world generation. If the
+	# squared normalized distance is well past the warp envelope, we
+	# can return a clearly-negative value without the sqrt or the
+	# noise sample. `(1 + warp)^2` is the upper bound on the actual
+	# distance after warp, so anything beyond that is guaranteed ocean.
+	var max_warped: float = 1.0 + coastline_warp + 0.05  # small slack
+	if d2 > max_warped * max_warped:
+		# Approximate land_factor as `1 - sqrt(d2)` would be; for the
+		# fast path we just return a clearly-negative magnitude that
+		# preserves "further out = more negative" ordering used by
+		# `_seabed_layer_at`.
+		return 1.0 - sqrt(d2)
+	var dist: float = sqrt(d2)
 	if coastline_noise != null:
 		dist += coastline_noise.get_noise_2d(q, r) * coastline_warp
 	return 1.0 - dist

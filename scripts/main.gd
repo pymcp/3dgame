@@ -13,14 +13,18 @@ extends Node
 
 const OVERWORLD_RENDER_BIT: int = 2   # bit 1 → layer 2
 const MINE_RENDER_BIT: int = 4        # bit 2 → layer 3
+const PORTAL_RENDER_BIT: int = 8      # bit 3 → layer 4
 const OVERWORLD_COLLISION_LAYER: int = 2  # bitmask: bit 1 → physics layer 2
 const MINE_COLLISION_LAYER: int = 4       # bitmask: bit 2 → physics layer 3
+const PORTAL_COLLISION_LAYER: int = 8     # bitmask: bit 3 → physics layer 4
 const OVERWORLD_CAM_MASK: int = 3     # layers 1 + 2
 const MINE_CAM_MASK: int = 5          # layers 1 + 3
+const PORTAL_CAM_MASK: int = 9        # layers 1 + 4
 
 var world: Node3D
 var overworld: HexWorld
 var mine: HexWorld
+var portal_world: HexWorld
 var overworld_pathfinder: HexPathfinder
 var mine_pathfinder: HexPathfinder
 var overworld_spawner: CreatureSpawner
@@ -43,9 +47,18 @@ var transitions: MineTransitionController
 var _world_env: WorldEnvironment
 var _sun: DirectionalLight3D
 var _underground_env: Environment
+var _portal_env: Environment
 
 var _p1_enabled: bool = true
 var _p2_enabled: bool = true
+
+## Last road coordinate placed via F10 (for auto-fill chaining).
+var _last_road_qr: Vector2i = Vector2i(999999, 999999)
+
+## Track which portal cells already have a spinning ring decoration so
+## we don't double-decorate. Keys are `Vector3i` cell coords.
+var _decorated_portals_overworld: Dictionary = {}
+var _decorated_portals_realm: Dictionary = {}
 
 
 func _ready() -> void:
@@ -106,6 +119,14 @@ func _setup_world() -> void:
 	_underground_env.ambient_light_energy = 0.1
 	_underground_env.tonemap_mode = 3  # ACES
 
+	# Portal-realm environment — deep purple void.
+	_portal_env = Environment.new()
+	_portal_env.background_mode = Environment.BG_COLOR
+	_portal_env.background_color = Color(0.05, 0.02, 0.08)
+	_portal_env.ambient_light_color = Color(0.7, 0.45, 1.0)
+	_portal_env.ambient_light_energy = 0.35
+	_portal_env.tonemap_mode = 3  # ACES
+
 
 func _setup_worlds() -> void:
 	# Overworld HexWorld.
@@ -135,6 +156,29 @@ func _setup_worlds() -> void:
 	var mine_palette: TilePalette = DefaultPalettes.build_mine()
 	var mine_gen: MineHexGenerator = MineHexGenerator.new(GameManager.world_seed + 7919)
 	mine.setup(mine_palette, mine_gen)
+
+	# Portal-realm HexWorld — sparse floating purple-stone islands in
+	# a void. Coords are compressed (÷10) relative to the overworld
+	# so the realm is intentionally smaller.
+	portal_world = HexWorld.new()
+	portal_world.name = "PortalRealm"
+	portal_world.render_layer_bit = PORTAL_RENDER_BIT
+	portal_world.collision_layer = PORTAL_COLLISION_LAYER
+	portal_world.load_radius_qr = 2
+	portal_world.load_radius_layer = 2
+	portal_world.chunk_size_layer = 4
+	world.add_child(portal_world)
+	var portal_palette: TilePalette = DefaultPalettes.build_portal_realm()
+	var portal_gen: PortalRealmHexGenerator = PortalRealmHexGenerator.new(GameManager.world_seed + 13339)
+	portal_world.setup(portal_palette, portal_gen)
+
+	# Auto-decorate placed portal markers with a spinning ring.
+	overworld.cell_placed.connect(_on_overworld_cell_placed)
+	portal_world.cell_placed.connect(_on_portal_cell_placed)
+	# Generator-placed cells don't fire `cell_placed`; rescan loaded
+	# chunks for new portal markers each chunk-load.
+	overworld.chunk_loaded.connect(_on_overworld_chunk_loaded)
+	portal_world.chunk_loaded.connect(_on_portal_chunk_loaded)
 
 
 func _setup_players() -> void:
@@ -277,9 +321,11 @@ func _wire_interactions() -> void:
 	int1.set_camera(camera1)
 	int1.set_viewport(viewport_p1)
 	int1.set_worlds(overworld, mine)
+	int1.set_portal_world(portal_world)
 	int2.set_camera(camera2)
 	int2.set_viewport(viewport_p2)
 	int2.set_worlds(overworld, mine)
+	int2.set_portal_world(portal_world)
 	int1.mine_completed.connect(_on_mine_completed.bind(1))
 	int2.mine_completed.connect(_on_mine_completed.bind(2))
 
@@ -289,6 +335,7 @@ func _setup_transitions() -> void:
 	transitions.name = "MineTransitionController"
 	add_child(transitions)
 	transitions.setup(player1, player2, camera1, camera2, overworld, mine, _underground_env)
+	transitions.setup_portal(portal_world, _portal_env)
 	if mining_ui_p1:
 		mining_ui_p1.set_mine_entry_progress_getter(get_mine_entry_progress_p1)
 		mining_ui_p1.set_ladder_exit_progress_getter(get_ladder_exit_progress_p1)
@@ -311,6 +358,8 @@ func _setup_decorations() -> void:
 	var wb_coord: Vector3i = Vector3i(2, 0, 0)
 	var wb_idx: int = mine.palette.overlay_index_by_marker(&"workbench")
 	if wb_idx >= 0:
+		# Synchronous prime: workbench needs to be placed *now* so the
+		# crafting nearness check sees it on the next frame.
 		mine.prime_around(mine.coord_to_world(wb_coord))
 		# Make sure a floor exists beneath the workbench (the ladder
 		# chamber has open air at layer 0, floor at -1).
@@ -393,18 +442,35 @@ func _process(delta: float) -> void:
 	# Stream each world only for the players currently in it (and enabled).
 	var ow_players: Array[Node3D] = []
 	var mine_players: Array[Node3D] = []
+	var portal_players: Array[Node3D] = []
 	if _p1_enabled:
-		if not player1.is_underground:
-			ow_players.append(player1)
-		else:
-			mine_players.append(player1)
+		match player1.world_state:
+			PlayerController.WorldState.MINE:
+				mine_players.append(player1)
+			PlayerController.WorldState.PORTAL:
+				portal_players.append(player1)
+			_:
+				ow_players.append(player1)
 	if _p2_enabled:
-		if not player2.is_underground:
-			ow_players.append(player2)
-		else:
-			mine_players.append(player2)
+		match player2.world_state:
+			PlayerController.WorldState.MINE:
+				mine_players.append(player2)
+			PlayerController.WorldState.PORTAL:
+				portal_players.append(player2)
+			_:
+				ow_players.append(player2)
 	overworld.set_active_players(ow_players)
 	mine.set_active_players(mine_players)
+	if portal_world != null:
+		portal_world.set_active_players(portal_players)
+	# Drain pathfinder pending work each frame (chunk-load scans + cell
+	# refreshes). This used to all happen synchronously inside the
+	# chunk_loaded signal handler and was a major source of stutter on
+	# mine entry / fast travel.
+	if overworld_pathfinder != null:
+		overworld_pathfinder.process_pending()
+	if mine_pathfinder != null:
+		mine_pathfinder.process_pending()
 	if overworld_spawner != null:
 		var ow_pcs: Array[PlayerController] = []
 		for n: Node3D in ow_players:
@@ -437,6 +503,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			_magic_drop_mine_entrance()
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_F10:
+			Toast.push("F10 pressed")
 			_debug_place_road()
 			get_viewport().set_input_as_handled()
 		elif key.keycode == KEY_PAGEUP:
@@ -491,10 +558,14 @@ func _magic_drop_mine_entrance() -> void:
 	if anchor == null:
 		return
 
-	# Target hex: a few tiles to the east of the anchor, on layer 0.
+	# Target hex: a few tiles to the east of the anchor, at the actual surface.
 	var anchor_pos: Vector3 = anchor.global_position + Vector3(2.5, 0.0, 0.0)
 	var anchor_coord: Vector3i = overworld.world_to_coord(anchor_pos)
-	var target_coord: Vector3i = Vector3i(anchor_coord.x, anchor_coord.y, 0)
+
+	# Find a safe surface column: search outward for a land hex where
+	# the surface is above sea level and the base supports a mine.
+	var gen: OverworldHexGenerator = overworld.generator as OverworldHexGenerator
+	var target_coord: Vector3i = _find_mine_placement_coord(anchor_coord, gen)
 
 	# Force the target chunk to load synchronously — otherwise the
 	# place_base/place_overlay calls below silently no-op and the
@@ -548,12 +619,114 @@ func _magic_drop_mine_entrance() -> void:
 		null,
 		func() -> void:
 			overworld.place_overlay(target_coord, overlay_idx)
-			_auto_route_road_to_nearest_mine(target_coord),
+			_auto_route_road_to_nearest_mine(target_coord)
+			_magic_drop_portal_near(target_coord, gen),
 	)
 
 
+## Drop a portal one ring away from `near_coord`, so F9 places mine
+## and portal as a paired pair. Falls back silently if no valid
+## land column is nearby.
+func _magic_drop_portal_near(near_coord: Vector3i, gen: OverworldHexGenerator) -> void:
+	var portal_overlay_idx: int = overworld.palette.overlay_index_by_marker(&"portal")
+	if portal_overlay_idx < 0:
+		return
+	var portal_scene: PackedScene = load("res://assets/portals/portal-ring.glb") as PackedScene
+	# Search a small ring around `near_coord` for a free land column.
+	var portal_coord: Vector3i = _find_portal_placement_coord(near_coord, gen)
+	if portal_coord == Vector3i.ZERO and near_coord != Vector3i.ZERO:
+		# fall through — we'll still try near_coord with offset
+		portal_coord = Vector3i(near_coord.x + 2, near_coord.y - 1, near_coord.z)
+	overworld.prime_around(overworld.coord_to_world(portal_coord))
+	# Make sure the cell exists with a stone base, no overlay.
+	var stone_idx: int = overworld.palette.base_index(&"stone")
+	var existing: HexCell = overworld.get_cell(portal_coord)
+	if existing == null:
+		if stone_idx >= 0:
+			overworld.place_base(portal_coord, stone_idx)
+	else:
+		if existing.has_overlay():
+			existing.overlay_id = -1
+			overworld.set_cell(portal_coord, existing)
+	var portal_world_pos: Vector3 = overworld.coord_to_world(portal_coord)
+	if portal_scene == null:
+		# No fancy fall — just place the overlay directly.
+		overworld.place_overlay(portal_coord, portal_overlay_idx)
+		Toast.push("Mine + portal placed", Color(0.7, 0.45, 1.0))
+		return
+	tile_placer.place_magic(
+		portal_scene,
+		portal_world_pos,
+		null,
+		func() -> void:
+			overworld.place_overlay(portal_coord, portal_overlay_idx)
+			Toast.push("Mine + portal placed", Color(0.7, 0.45, 1.0)),
+	)
+
+
+## Search a small ring around `center` for a land column above sea
+## level. Mirrors `_find_mine_placement_coord` but skips the center
+## (we want the portal a few hexes away from the mine).
+func _find_portal_placement_coord(center: Vector3i, gen: OverworldHexGenerator) -> Vector3i:
+	if gen == null:
+		return Vector3i(center.x + 2, center.y - 1, 0)
+	for radius: int in range(2, 6):
+		var ring: Array[Vector2i] = []
+		for dq: int in range(-radius, radius + 1):
+			for dr: int in range(-radius, radius + 1):
+				if HexGrid.axial_distance(Vector2i.ZERO, Vector2i(dq, dr)) == radius:
+					ring.append(Vector2i(center.x + dq, center.y + dr))
+		for qr: Vector2i in ring:
+			var sl: int = gen.surface_layer_at(qr.x, qr.y)
+			if sl < 0:
+				continue
+			var coord: Vector3i = Vector3i(qr.x, qr.y, sl)
+			var cell: HexCell = overworld.get_cell(coord)
+			if cell == null:
+				continue
+			# Don't overwrite an existing overlay.
+			if cell.has_overlay():
+				continue
+			return coord
+	return Vector3i(center.x + 2, center.y - 1, 0)
+
+
+## Search outward from `center` for a land column whose surface is
+## above sea level (not underwater) and has a base that supports the
+## mine entrance overlay (grass/dirt/stone). Returns the surface cell
+## coord, or `center` at layer 0 as fallback.
+func _find_mine_placement_coord(center: Vector3i, gen: OverworldHexGenerator) -> Vector3i:
+	if gen == null:
+		return Vector3i(center.x, center.y, 0)
+	# Spiral outward up to 6 rings.
+	for radius: int in range(0, 7):
+		var ring: Array[Vector2i] = []
+		if radius == 0:
+			ring = [Vector2i(center.x, center.y)]
+		else:
+			for dq: int in range(-radius, radius + 1):
+				for dr: int in range(-radius, radius + 1):
+					if HexGrid.axial_distance(Vector2i.ZERO, Vector2i(dq, dr)) == radius:
+						ring.append(Vector2i(center.x + dq, center.y + dr))
+		for qr: Vector2i in ring:
+			var sl: int = gen.surface_layer_at(qr.x, qr.y)
+			if sl < 0:
+				continue  # Below sea level — skip
+			# Check the actual cell has a valid base.
+			var coord: Vector3i = Vector3i(qr.x, qr.y, sl)
+			var cell: HexCell = overworld.get_cell(coord)
+			if cell == null:
+				continue
+			var tk: TileKind = overworld.palette.bases[cell.base_id] if cell.base_id >= 0 and cell.base_id < overworld.palette.bases.size() else null
+			if tk != null and tk.id in [&"stone", &"dirt", &"grass"]:
+				return coord
+	# Fallback: use center at whatever surface layer it has.
+	return Vector3i(center.x, center.y, maxi(gen.surface_layer_at(center.x, center.y), 0))
+
+
 ## After placing a mine entrance, route a road to the nearest other mine.
-## Uses the overworld pathfinder for A* pathing through loaded chunks.
+## Uses hex line-drawing (cube coord lerp) to trace a straight path between
+## the two mines, then swaps base tiles to road shapes along the way.
 func _auto_route_road_to_nearest_mine(new_mine_coord: Vector3i) -> void:
 	var all_mines: Array[Vector3i] = overworld.find_all_markers(&"mine_entrance")
 	var best_coord: Vector3i = Vector3i.ZERO
@@ -571,23 +744,60 @@ func _auto_route_road_to_nearest_mine(new_mine_coord: Vector3i) -> void:
 		Toast.push("No nearby mine found for road", Color.YELLOW)
 		return
 
-	# Use same layer as the new mine (surface layer 0 by default).
-	var from_coord: Vector3i = Vector3i(new_mine_coord.x, new_mine_coord.y, new_mine_coord.z)
-	var to_coord: Vector3i = Vector3i(best_coord.x, best_coord.y, best_coord.z)
+	var from_qr: Vector2i = Vector2i(new_mine_coord.x, new_mine_coord.y)
+	var to_qr: Vector2i = Vector2i(best_coord.x, best_coord.y)
 
-	var path: Array[Vector3i] = overworld_pathfinder.find_path(from_coord, to_coord)
-	if path.is_empty():
-		Toast.push("No path found to nearest mine", Color.YELLOW)
-		return
+	# Hex line draw: lerp in cube coordinates, round each step.
+	var line: Array[Vector2i] = HexGrid.hex_line(from_qr, to_qr)
 
+	var gen: OverworldHexGenerator = overworld.generator as OverworldHexGenerator
 	var placed_count: int = 0
-	for coord: Vector3i in path:
-		if HexRoadPlacer.place_road(overworld, coord):
+	var fail_count: int = 0
+	# Prime the WHOLE line up front in a single pass (one prime per
+	# unique chunk) instead of per-cell. Was the dominant cost when the
+	# line crossed many chunks.
+	_prime_path_chunks(overworld, line, gen)
+	for qr: Vector2i in line:
+		# Skip the endpoints (mine entrance cells themselves).
+		if qr == from_qr or qr == to_qr:
+			continue
+		# Find the surface layer at this column.
+		var sl: int = gen.surface_layer_at(qr.x, qr.y) if gen != null else 0
+		var floor_coord: Vector3i = Vector3i(qr.x, qr.y, sl)
+		# Strip existing overlays (trees, rocks, hills) so the cell is
+		# clear for the road overlay.
+		var cell: HexCell = overworld.get_cell(floor_coord)
+		if cell == null:
+			fail_count += 1
+			continue
+		if cell.has_overlay():
+			cell.overlay_id = -1
+			overworld.set_cell(floor_coord, cell)
+		if HexRoadPlacer.place_road(overworld, floor_coord):
 			placed_count += 1
-	Toast.push("Road built: %d tiles" % placed_count)
+		else:
+			fail_count += 1
+	Toast.push("Road: %d placed, %d failed" % [placed_count, fail_count])
+
+
+## Prime every unique chunk along a hex line in a single pass.
+## Avoids the per-cell `prime_around` storm that used to load 5-10
+## redundant chunks per cell. A 12-cell line crossing 3 chunks now
+## primes 3 chunks total instead of ~150.
+func _prime_path_chunks(world: HexWorld, line: Array[Vector2i], gen: OverworldHexGenerator) -> void:
+	var primed: Dictionary = {}  # Vector3i chunk_pos -> true
+	for qr: Vector2i in line:
+		var sl: int = gen.surface_layer_at(qr.x, qr.y) if gen != null else 0
+		var coord: Vector3i = Vector3i(qr.x, qr.y, sl)
+		var cp: Vector3i = ChunkMath.cell_to_chunk(coord, world.chunk_size_qr, world.chunk_size_layer)
+		if primed.has(cp):
+			continue
+		primed[cp] = true
+		world.prime_around(world.coord_to_world(coord))
 
 
 ## Debug: place a road tile at the player's current hex. Triggered by F10.
+## If the last placed road is within 4 hexes, auto-fills the gap.
 func _debug_place_road() -> void:
 	var anchor: PlayerController = null
 	if _p1_enabled and not player1.is_underground:
@@ -598,10 +808,41 @@ func _debug_place_road() -> void:
 		Toast.push("Must be on the surface", Color.YELLOW)
 		return
 	var coord: Vector3i = overworld.world_to_coord(anchor.global_position)
-	if HexRoadPlacer.place_road(overworld, coord):
-		Toast.push("Road placed")
+	# Player stands on air; the road goes on the floor cell below.
+	var floor_coord: Vector3i = coord
+	if overworld.get_cell(coord) == null:
+		floor_coord = Vector3i(coord.x, coord.y, coord.z - 1)
+	var new_qr: Vector2i = Vector2i(floor_coord.x, floor_coord.y)
+	var gen: OverworldHexGenerator = overworld.generator as OverworldHexGenerator
+	# Auto-fill from last placed road if within range.
+	var dist: int = HexGrid.axial_distance(_last_road_qr, new_qr)
+	if dist > 1 and dist <= 4:
+		var line: Array[Vector2i] = HexGrid.hex_line(_last_road_qr, new_qr)
+		_prime_path_chunks(overworld, line, gen)
+		var filled: int = 0
+		for qr: Vector2i in line:
+			if qr == _last_road_qr:
+				continue
+			var sl: int = gen.surface_layer_at(qr.x, qr.y) if gen != null else 0
+			var fc: Vector3i = Vector3i(qr.x, qr.y, sl)
+			var cell: HexCell = overworld.get_cell(fc)
+			if cell == null:
+				continue
+			# Strip blocking overlays to make room for road.
+			if cell.has_overlay() and not HexRoadResolver.is_road(overworld, fc):
+				cell.overlay_id = -1
+				overworld.set_cell(fc, cell)
+			if HexRoadPlacer.place_road(overworld, fc):
+				filled += 1
+		_last_road_qr = new_qr
+		Toast.push("Road: %d filled" % filled)
 	else:
-		Toast.push("Cannot place road here", Color.YELLOW)
+		# Single placement or first road.
+		if HexRoadPlacer.place_road(overworld, floor_coord):
+			_last_road_qr = new_qr
+			Toast.push("Road placed")
+		else:
+			Toast.push("Cannot place road here", Color.YELLOW)
 
 
 func _on_mine_completed(coord: Vector3i, drops: PackedStringArray, dropped_base: bool, player_id: int) -> void:
@@ -631,3 +872,55 @@ func get_ladder_exit_progress_p1() -> float:
 
 func get_ladder_exit_progress_p2() -> float:
 	return transitions.get_ladder_exit_progress(2)
+
+
+# --- portal decoration ---------------------------------------------------
+
+## Auto-attach a spinning portal ring to any newly-placed `&"portal"`
+## cell on the overworld.
+func _on_overworld_cell_placed(coord: Vector3i) -> void:
+	if _decorated_portals_overworld.has(coord):
+		return
+	var cell: HexCell = overworld.get_cell(coord)
+	if cell == null or cell.overlay_id < 0:
+		return
+	if cell.overlay_id >= overworld.palette.overlays.size():
+		return
+	var ov: OverlayKind = overworld.palette.overlays[cell.overlay_id]
+	if ov == null or ov.marker != &"portal":
+		return
+	_decorated_portals_overworld[coord] = true
+	var deco: HexDecorator = DefaultDecorators.build_portal_ring(
+		OVERWORLD_RENDER_BIT, OVERWORLD_CAM_MASK
+	)
+	HexDecoratorNode.apply(overworld, coord, deco)
+
+
+## Auto-attach a spinning portal ring to any newly-placed
+## `&"portal_return"` cell in the portal realm.
+func _on_portal_cell_placed(coord: Vector3i) -> void:
+	if _decorated_portals_realm.has(coord):
+		return
+	var cell: HexCell = portal_world.get_cell(coord)
+	if cell == null or cell.overlay_id < 0:
+		return
+	if cell.overlay_id >= portal_world.palette.overlays.size():
+		return
+	var ov: OverlayKind = portal_world.palette.overlays[cell.overlay_id]
+	if ov == null or ov.marker != &"portal_return":
+		return
+	_decorated_portals_realm[coord] = true
+	var deco: HexDecorator = DefaultDecorators.build_portal_ring(
+		PORTAL_RENDER_BIT, PORTAL_CAM_MASK
+	)
+	HexDecoratorNode.apply(portal_world, coord, deco)
+
+
+func _on_overworld_chunk_loaded(_chunk_pos: Vector3i) -> void:
+	for coord: Vector3i in overworld.find_all_markers(&"portal"):
+		_on_overworld_cell_placed(coord)
+
+
+func _on_portal_chunk_loaded(_chunk_pos: Vector3i) -> void:
+	for coord: Vector3i in portal_world.find_all_markers(&"portal_return"):
+		_on_portal_cell_placed(coord)

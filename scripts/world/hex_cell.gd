@@ -15,7 +15,7 @@ var overlay_id: int = -1
 ## Extra hex-scale elevation added on top of `layer * LAYER_HEIGHT` (typically 0).
 var elevation: float = 0.0
 ## Y-rotation in 60° increments (0–5). 0 = 0°, 1 = 60°, … 5 = 300°.
-## Used by road overlays and any future rotated tiles.
+## Used by road tiles and any future rotated tiles.
 var rotation: int = 0
 
 

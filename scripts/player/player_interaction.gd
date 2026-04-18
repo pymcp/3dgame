@@ -26,6 +26,7 @@ var camera: Camera3D = null
 var viewport: SubViewport = null
 var overworld: HexWorld = null
 var mine: HexWorld = null
+var portal_world: HexWorld = null
 
 var _targeted_coord: Vector3i = NO_COORD
 var _is_mining: bool = false
@@ -76,11 +77,21 @@ func set_worlds(overworld_world: HexWorld, mine_world: HexWorld) -> void:
 	mine = mine_world
 
 
+func set_portal_world(portal_realm: HexWorld) -> void:
+	portal_world = portal_realm
+
+
 func _active_world() -> HexWorld:
 	var player: PlayerController = get_parent() as PlayerController
-	if player != null and player.is_underground:
-		return mine
-	return overworld
+	if player == null:
+		return overworld
+	match player.world_state:
+		PlayerController.WorldState.MINE:
+			return mine
+		PlayerController.WorldState.PORTAL:
+			return portal_world
+		_:
+			return overworld
 
 
 func _ensure_widgets() -> void:
@@ -512,7 +523,12 @@ func _sync_widget_render_layers() -> void:
 	# Match the player's current render layer bitmask so the highlight,
 	# crack overlay, and VFX are visible on the correct camera. Skip
 	# the recursive VFX walk when nothing has changed.
-	var bitmask: int = 2 if not player.is_underground else 4
+	var bitmask: int = 2
+	match player.world_state:
+		PlayerController.WorldState.MINE:
+			bitmask = 4
+		PlayerController.WorldState.PORTAL:
+			bitmask = 8
 	if bitmask == _last_widget_bitmask:
 		return
 	_last_widget_bitmask = bitmask

@@ -26,6 +26,10 @@ signal chunk_unloaded(chunk_pos: Vector3i)
 @export var unload_radius_layer: int = 3
 ## Max chunks built per frame (throttle to avoid hitches).
 @export var max_chunks_per_frame: int = 2
+## Max chunks built per frame when draining a `prime_around` request.
+## Higher than max_chunks_per_frame so teleport/setup priming finishes
+## quickly, but still bounded so a 50-chunk prime doesn't freeze a frame.
+@export var max_priming_chunks_per_frame: int = 6
 ## Streaming tick interval.
 @export var chunk_update_interval: float = 0.25
 ## `VisualInstance3D.layers` bitmask for every MMI in this world.
@@ -40,6 +44,14 @@ var _chunks: Dictionary = {}       # Vector3i chunk_pos -> HexWorldChunk
 var _load_queue: Array[Vector3i] = []
 var _pending_chunks: Dictionary = {}  # Vector3i -> true (in-queue or loaded)
 var _cell_damage: Dictionary = {}  # Vector3i coord -> float
+
+## Coords of cells that have been edited this frame and need their
+## owning chunk's visuals + collision rebuilt. Drained in `_process`.
+var _dirty_chunks: Dictionary = {}  # Vector3i chunk_pos -> true
+
+## Marker -> Set[Vector3i] cache so `find_all_markers` is O(1) instead
+## of O(loaded_chunks * cells_per_chunk). Maintained on cell edits.
+var _markers: Dictionary = {}  # StringName -> Dictionary[Vector3i,true]
 
 var _active_players: Array[Node3D] = []
 var _update_timer: float = 0.0
@@ -73,6 +85,7 @@ func _process(delta: float) -> void:
 		_update_timer = 0.0
 		_update_streaming()
 	_drain_load_queue()
+	_flush_dirty_chunks()
 
 
 # --- streaming -----------------------------------------------------------
@@ -80,44 +93,43 @@ func _process(delta: float) -> void:
 func _update_streaming() -> void:
 	if palette == null or generator == null:
 		return
-	# Cache each active player's chunk center once so `wanted` build
-	# AND `_is_outside_unload_radius` both reuse the same centers
-	# (previously each of N loaded chunks recomputed the centers,
-	# which is O(chunks × players) per tick).
+	# Cache each active player's chunk center once.
 	var centers: Array[Vector3i] = []
 	for player: Node3D in _active_players:
 		if is_instance_valid(player):
 			centers.append(_chunk_at_world(player.global_position))
 
-	var wanted: Dictionary = {}  # Vector3i chunk_pos -> true
+	# Build the wanted set + enqueue missing chunks in a single pass.
+	# (We don't keep `wanted` for the unload pass; instead the unload
+	# pass distance-checks each loaded chunk directly against centers.)
 	for center: Vector3i in centers:
 		for dz: int in range(-load_radius_layer, load_radius_layer + 1):
 			for dq: int in range(-load_radius_qr, load_radius_qr + 1):
 				for dr: int in range(-load_radius_qr, load_radius_qr + 1):
-					wanted[Vector3i(center.x + dq, center.y + dr, center.z + dz)] = true
-	# Enqueue missing chunks.
-	for cp_v: Variant in wanted.keys():
-		var cp: Vector3i = cp_v as Vector3i
-		if not _chunks.has(cp) and not _pending_chunks.has(cp):
-			_load_queue.append(cp)
-			_pending_chunks[cp] = true
-	# Unload chunks beyond the unload radius.
+					var cp: Vector3i = Vector3i(center.x + dq, center.y + dr, center.z + dz)
+					if not _chunks.has(cp) and not _pending_chunks.has(cp):
+						_load_queue.append(cp)
+						_pending_chunks[cp] = true
+
+	# Unload chunks beyond the unload radius. Iterate _chunks once,
+	# distance-check directly against centers (faster than building
+	# a "wanted" dict).
+	if centers.is_empty():
+		return  # No active players — keep everything loaded.
 	var to_unload: Array[Vector3i] = []
 	for cp_v: Variant in _chunks.keys():
 		var cp: Vector3i = cp_v as Vector3i
-		if _is_outside_unload_radius(cp, centers):
+		var keep: bool = false
+		for center: Vector3i in centers:
+			if absi(cp.x - center.x) <= unload_radius_qr \
+				and absi(cp.y - center.y) <= unload_radius_qr \
+				and absi(cp.z - center.z) <= unload_radius_layer:
+				keep = true
+				break
+		if not keep:
 			to_unload.append(cp)
 	for cp: Vector3i in to_unload:
 		_unload_chunk(cp)
-
-
-func _is_outside_unload_radius(cp: Vector3i, centers: Array[Vector3i]) -> bool:
-	for center: Vector3i in centers:
-		if absi(cp.x - center.x) <= unload_radius_qr \
-			and absi(cp.y - center.y) <= unload_radius_qr \
-			and absi(cp.z - center.z) <= unload_radius_layer:
-			return false
-	return true
 
 
 func _drain_load_queue() -> void:
@@ -129,11 +141,44 @@ func _drain_load_queue() -> void:
 		built += 1
 
 
+## Drain dirty chunks once per frame, coalescing many edits into one
+## rebuild per chunk. Drastically reduces hitches when batch-placing
+## roads, batch-mining, or generating chunks that emit many cells.
+func _flush_dirty_chunks() -> void:
+	if _dirty_chunks.is_empty():
+		return
+	var snapshot: Array = _dirty_chunks.keys()
+	_dirty_chunks.clear()
+	for cp_v: Variant in snapshot:
+		var chunk: HexWorldChunk = _chunks.get(cp_v) as HexWorldChunk
+		if chunk != null and is_instance_valid(chunk):
+			chunk.flush_rebuild()
+
+
+## Force a single chunk to rebuild now (skip the per-frame defer).
+## Used by `mine_cell` / `place_*` callers that want immediate feedback.
+func flush_chunk_now(coord: Vector3i) -> void:
+	var cp: Vector3i = ChunkMath.cell_to_chunk(coord, chunk_size_qr, chunk_size_layer)
+	_dirty_chunks.erase(cp)
+	var chunk: HexWorldChunk = _chunks.get(cp) as HexWorldChunk
+	if chunk != null and is_instance_valid(chunk):
+		chunk.flush_rebuild()
+
+
 ## Force-load every chunk within `load_radius_* (+ extras)` of
-## `world_pos` right now, bypassing the per-frame throttle. Use before
-## teleporting a player into this world so they don't fall through
-## ungenerated air, or at startup to hide streaming pop-in.
-func prime_around(world_pos: Vector3, extra_radius_qr: int = 0, extra_radius_layer: int = 0) -> void:
+## `world_pos` right now. Use before teleporting a player into this
+## world so they don't fall through ungenerated air.
+##
+## **Synchronous** by default (back-compat with existing callers that
+## need ground under the player on the next frame). Pass `async=true`
+## to enqueue instead — the chunks will load over the next few frames
+## via the normal `_drain_load_queue` budget. Async priming is a big
+## win when a caller doesn't actually need the ground immediately
+## (e.g. workbench placement at startup).
+func prime_around(world_pos: Vector3,
+		extra_radius_qr: int = 0,
+		extra_radius_layer: int = 0,
+		async: bool = false) -> void:
 	if palette == null or generator == null:
 		return
 	var center: Vector3i = _chunk_at_world(world_pos)
@@ -143,9 +188,16 @@ func prime_around(world_pos: Vector3, extra_radius_qr: int = 0, extra_radius_lay
 		for dq: int in range(-rqr, rqr + 1):
 			for dr: int in range(-rqr, rqr + 1):
 				var cp: Vector3i = Vector3i(center.x + dq, center.y + dr, center.z + dz)
-				if not _chunks.has(cp):
-					_load_chunk(cp)
-					_pending_chunks[cp] = true
+				if _chunks.has(cp):
+					continue
+				if async:
+					if not _pending_chunks.has(cp):
+						_load_queue.push_front(cp)  # priority over streaming
+						_pending_chunks[cp] = true
+				else:
+					if not _chunks.has(cp):
+						_load_chunk(cp)
+						_pending_chunks[cp] = true
 
 
 func _load_chunk(cp: Vector3i) -> void:
@@ -156,6 +208,10 @@ func _load_chunk(cp: Vector3i) -> void:
 	chunk.apply_collision_layer(collision_layer)
 	# Generate content into the chunk.
 	generator.generate_chunk(cp, chunk, palette)
+	# Index any markers placed during generation.
+	_index_chunk_markers(cp, chunk)
+	# Initial build is synchronous — chunk is freshly born, callers
+	# expect it usable on next frame.
 	chunk.rebuild()
 	_chunks[cp] = chunk
 	chunk_loaded.emit(cp)
@@ -167,6 +223,8 @@ func _unload_chunk(cp: Vector3i) -> void:
 	var chunk: HexWorldChunk = _chunks[cp] as HexWorldChunk
 	_chunks.erase(cp)
 	_pending_chunks.erase(cp)
+	_dirty_chunks.erase(cp)
+	_unindex_chunk_markers(cp, chunk)
 	if is_instance_valid(chunk):
 		chunk.queue_free()
 	chunk_unloaded.emit(cp)
@@ -289,6 +347,21 @@ const NO_COORD: Vector3i = Vector3i(-99999, -99999, -99999)
 func find_nearby_marker(coord: Vector3i, marker: StringName = &"") -> Vector3i:
 	if palette == null:
 		return NO_COORD
+	# Fast path: when a specific marker is requested, scan only the
+	# cached coord set for that marker (typically <10 entries world-wide).
+	if marker != &"":
+		var coords_v: Variant = _markers.get(marker)
+		if coords_v == null:
+			return NO_COORD
+		var coords: Dictionary = coords_v
+		for c_v: Variant in coords.keys():
+			var c: Vector3i = c_v as Vector3i
+			if absi(c.z - coord.z) > 1:
+				continue
+			if HexGrid.axial_distance(Vector2i(c.x, c.y), Vector2i(coord.x, coord.y)) <= 1:
+				return c
+		return NO_COORD
+	# Slow path: any marker — fall through to the original neighborhood scan.
 	for dy: int in [0, -1, 1]:
 		for dq: int in range(-1, 2):
 			for dr: int in range(-1, 2):
@@ -303,27 +376,29 @@ func find_nearby_marker(coord: Vector3i, marker: StringName = &"") -> Vector3i:
 				var ok: OverlayKind = palette.overlays[cell.overlay_id]
 				if ok == null:
 					continue
-				if marker == &"":
-					if ok.marker != &"":
-						return c
-				elif ok.marker == marker:
+				if ok.marker != &"":
 					return c
 	return NO_COORD
 
 
-## Replace or insert a cell at `coord`. The chunk is rebuilt.
+## Replace or insert a cell at `coord`. Defers chunk rebuild to the
+## end-of-frame flush so multiple edits coalesce.
 func set_cell(coord: Vector3i, cell: HexCell) -> void:
 	var chunk: HexWorldChunk = _chunk_for_coord(coord)
 	if chunk == null:
 		return
 	var local: Vector3i = ChunkMath.cell_to_local(
-		coord, chunk.chunk_pos, chunk_size_qr, chunk_size_layer
-	)
+		coord, chunk.chunk_pos, chunk_size_qr, chunk_size_layer)
+	# Update marker index based on the OLD vs NEW cell at this coord
+	# so we don't leak stale entries when a marker is mined or replaced.
+	var old: HexCell = chunk.get_cell_local(local)
+	_unindex_cell_marker(coord, old)
 	cell.q = coord.x
 	cell.r = coord.y
 	cell.layer = coord.z
 	chunk.set_cell_local(local, cell)
-	chunk.rebuild()
+	_index_cell_marker(coord, cell)
+	_dirty_chunks[chunk.chunk_pos] = true
 
 
 func remove_cell(coord: Vector3i) -> void:
@@ -333,8 +408,91 @@ func remove_cell(coord: Vector3i) -> void:
 	var local: Vector3i = ChunkMath.cell_to_local(
 		coord, chunk.chunk_pos, chunk_size_qr, chunk_size_layer
 	)
+	var old: HexCell = chunk.get_cell_local(local)
+	_unindex_cell_marker(coord, old)
 	chunk.clear_cell_local(local)
-	chunk.rebuild()
+	_dirty_chunks[chunk.chunk_pos] = true
+
+
+# --- marker index --------------------------------------------------------
+#
+# Maintains `_markers: StringName -> Set[Vector3i]` so `find_all_markers`
+# and the fast path of `find_nearby_marker` can answer in O(matches)
+# instead of scanning every cell of every loaded chunk.
+
+func _index_cell_marker(coord: Vector3i, cell: HexCell) -> void:
+	if cell == null or palette == null or not cell.has_overlay():
+		return
+	if cell.overlay_id < 0 or cell.overlay_id >= palette.overlays.size():
+		return
+	var ok: OverlayKind = palette.overlays[cell.overlay_id]
+	if ok == null or ok.marker == &"":
+		return
+	var bucket_v: Variant = _markers.get(ok.marker)
+	var bucket: Dictionary
+	if bucket_v == null:
+		bucket = {}
+		_markers[ok.marker] = bucket
+	else:
+		bucket = bucket_v
+	bucket[coord] = true
+
+
+func _unindex_cell_marker(coord: Vector3i, cell: HexCell) -> void:
+	if cell == null or palette == null or not cell.has_overlay():
+		return
+	if cell.overlay_id < 0 or cell.overlay_id >= palette.overlays.size():
+		return
+	var ok: OverlayKind = palette.overlays[cell.overlay_id]
+	if ok == null or ok.marker == &"":
+		return
+	var bucket_v: Variant = _markers.get(ok.marker)
+	if bucket_v != null:
+		(bucket_v as Dictionary).erase(coord)
+
+
+func _index_chunk_markers(cp: Vector3i, chunk: HexWorldChunk) -> void:
+	if chunk == null or palette == null:
+		return
+	# Fast path: no markers exist in any palette overlay -> skip entirely.
+	if not _palette_has_any_marker():
+		return
+	for local_v: Variant in chunk.cells:
+		var cell: HexCell = chunk.cells[local_v] as HexCell
+		if cell == null or not cell.has_overlay():
+			continue
+		var coord: Vector3i = ChunkMath.local_to_cell(
+			local_v as Vector3i, cp, chunk_size_qr, chunk_size_layer)
+		_index_cell_marker(coord, cell)
+
+
+func _unindex_chunk_markers(cp: Vector3i, chunk: HexWorldChunk) -> void:
+	if chunk == null or palette == null:
+		return
+	if not _palette_has_any_marker():
+		return
+	for local_v: Variant in chunk.cells:
+		var cell: HexCell = chunk.cells[local_v] as HexCell
+		if cell == null or not cell.has_overlay():
+			continue
+		var coord: Vector3i = ChunkMath.local_to_cell(
+			local_v as Vector3i, cp, chunk_size_qr, chunk_size_layer)
+		_unindex_cell_marker(coord, cell)
+
+
+# Cached `palette has any marker?` answer.
+var _palette_has_marker_cached: int = -1  # -1 = unknown, 0 = false, 1 = true
+func _palette_has_any_marker() -> bool:
+	if _palette_has_marker_cached != -1:
+		return _palette_has_marker_cached == 1
+	var any: bool = false
+	if palette != null:
+		for ok: OverlayKind in palette.overlays:
+			if ok != null and ok.marker != &"":
+				any = true
+				break
+	_palette_has_marker_cached = 1 if any else 0
+	return any
 
 
 # --- damage / mining -----------------------------------------------------
@@ -381,6 +539,9 @@ func mine_cell(coord: Vector3i) -> MineResult:
 		result.drops = ok.drops if ok != null else PackedStringArray()
 		cell.overlay_id = -1
 		set_cell(coord, cell)
+		# Mining wants instant visual + collision feedback so the next
+		# swing is on the new top surface.
+		flush_chunk_now(coord)
 		cell_mined.emit(coord, result.base_id, result.overlay_id, false)
 		return result
 	# No overlay → remove the cell entirely.
@@ -393,6 +554,7 @@ func mine_cell(coord: Vector3i) -> MineResult:
 	result.overlay_id = -1
 	result.drops = tk.drops if tk != null else PackedStringArray()
 	remove_cell(coord)
+	flush_chunk_now(coord)
 	cell_mined.emit(coord, result.base_id, -1, true)
 	return result
 
@@ -468,25 +630,15 @@ func swap_overlay(coord: Vector3i, new_overlay_id: int, new_rotation: int) -> vo
 
 ## Scan all loaded chunks and return every coord whose cell carries
 ## an overlay with the given `marker`. Returns an empty array when
-## nothing matches. Used by F9 to find existing mine entrances.
+## nothing matches. O(matches) thanks to the marker index.
 func find_all_markers(marker: StringName) -> Array[Vector3i]:
 	var results: Array[Vector3i] = []
-	if palette == null:
+	var bucket_v: Variant = _markers.get(marker)
+	if bucket_v == null:
 		return results
-	for cp_v: Variant in _chunks.keys():
-		var chunk: HexWorldChunk = _chunks[cp_v] as HexWorldChunk
-		if chunk == null:
-			continue
-		for local_v: Variant in chunk.cells.keys():
-			var cell: HexCell = chunk.cells[local_v] as HexCell
-			if cell == null or not cell.has_overlay():
-				continue
-			if cell.overlay_id < 0 or cell.overlay_id >= palette.overlays.size():
-				continue
-			var ok: OverlayKind = palette.overlays[cell.overlay_id]
-			if ok != null and ok.marker == marker:
-				var local: Vector3i = local_v as Vector3i
-				results.append(ChunkMath.local_to_cell(local, cp_v as Vector3i, chunk_size_qr, chunk_size_layer))
+	var bucket: Dictionary = bucket_v
+	for c_v: Variant in bucket.keys():
+		results.append(c_v as Vector3i)
 	return results
 
 

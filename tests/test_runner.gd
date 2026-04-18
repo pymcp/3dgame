@@ -29,6 +29,11 @@ func _initialize() -> void:
 	_test_hex_cell_rotation()
 	_test_road_bitmask_normalization()
 	_test_road_overlay_registration()
+	_test_portal_realm_palette()
+	_test_overworld_portal_overlay()
+	_test_portal_compression_math()
+	_test_portal_items_registered()
+	_test_player_world_state_enum()
 
 	print("")
 	print("Passed: %d   Failed: %d" % [_passed, _failures])
@@ -441,7 +446,71 @@ func _test_road_bitmask_normalization() -> void:
 func _test_road_overlay_registration() -> void:
 	print("-- Road overlay registration")
 	var pal: TilePalette = DefaultPalettes.build_overworld()
-	# Verify all road overlay ids are present in the palette.
-	for road_id: StringName in HexRoadResolver.ROAD_OVERLAY_IDS:
+	var road_ids: Array[StringName] = [
+		&"road_end", &"road_straight", &"road_corner_sharp", &"road_corner",
+		&"road_intersection_a", &"road_intersection_b", &"road_intersection_c",
+		&"road_intersection_d", &"road_intersection_e", &"road_intersection_f",
+		&"road_intersection_g", &"road_intersection_h", &"road_crossing",
+	]
+	for road_id: StringName in road_ids:
 		var idx: int = pal.overlay_index(road_id)
 		_assert_eq(idx >= 0, true, "palette has road overlay: %s" % road_id)
+
+
+func _test_portal_realm_palette() -> void:
+	print("-- DefaultPalettes.build_portal_realm")
+	var pal: TilePalette = DefaultPalettes.build_portal_realm()
+	_assert_eq(pal.base_index(&"portal_stone") >= 0, true, "portal_stone present")
+	_assert_eq(pal.base_index(&"portal_dirt") >= 0, true, "portal_dirt present")
+	_assert_eq(pal.base_index(&"portal_bedrock") >= 0, true, "portal_bedrock present")
+	_assert_eq(pal.overlay_index(&"ore_amethyst") >= 0, true, "ore_amethyst overlay present")
+	_assert_eq(pal.overlay_index(&"portal_return") >= 0, true, "portal_return overlay present")
+	_assert_eq(pal.overlay_index_by_marker(&"portal_return") >= 0, true, "portal_return marker indexed")
+
+
+func _test_overworld_portal_overlay() -> void:
+	print("-- Overworld palette has portal overlay")
+	var pal: TilePalette = DefaultPalettes.build_overworld()
+	_assert_eq(pal.overlay_index(&"portal") >= 0, true, "portal overlay present")
+	_assert_eq(pal.overlay_index_by_marker(&"portal") >= 0, true, "portal marker indexed")
+
+
+func _compress(c: Vector3i, n: int) -> Vector3i:
+	# Mirrors MineTransitionController.compress_to_portal_coord (PORTAL_COMPRESS=10).
+	# Pure floori-based, negative-safe integer division.
+	return Vector3i(
+		floori(float(c.x) / float(n)),
+		floori(float(c.y) / float(n)),
+		0
+	)
+
+
+func _test_portal_compression_math() -> void:
+	print("-- Portal coord compression (floori-based, N=10)")
+	_assert_eq(_compress(Vector3i(60, -45, 0), 10), Vector3i(6, -5, 0), "(60,-45) -> (6,-5)")
+	_assert_eq(_compress(Vector3i(0, 0, 9), 10), Vector3i(0, 0, 0), "(0,0,9) -> (0,0,0) (layer dropped)")
+	_assert_eq(_compress(Vector3i(-1, -10, 0), 10), Vector3i(-1, -1, 0), "(-1,-10) -> (-1,-1) negative-safe")
+	_assert_eq(_compress(Vector3i(9, 10, 0), 10), Vector3i(0, 1, 0), "(9,10) -> (0,1) boundary")
+	# Verify the constant is what we expect by reading it from the script.
+	var mtc: GDScript = load("res://scripts/player/mine_transition_controller.gd") as GDScript
+	_assert_eq(mtc.get_script_constant_map().get(&"PORTAL_COMPRESS", -1), 10, "PORTAL_COMPRESS == 10")
+
+
+func _test_portal_items_registered() -> void:
+	print("-- ItemRegistry has portal materials")
+	var reg: Node = root.get_node_or_null("ItemRegistry")
+	_assert_eq(reg != null, true, "ItemRegistry autoload present")
+	if reg == null:
+		return
+	_assert_eq(reg.has_def(&"amethyst"), true, "amethyst registered")
+	_assert_eq(reg.has_def(&"portal_shard"), true, "portal_shard registered")
+	var amethyst: ItemDef = reg.get_def(&"amethyst")
+	if amethyst:
+		_assert_eq(amethyst.category, ItemDef.CAT_MATERIAL, "amethyst is material")
+
+
+func _test_player_world_state_enum() -> void:
+	print("-- PlayerController.WorldState enum")
+	_assert_eq(int(PlayerController.WorldState.OVERWORLD), 0, "OVERWORLD = 0")
+	_assert_eq(int(PlayerController.WorldState.MINE), 1, "MINE = 1")
+	_assert_eq(int(PlayerController.WorldState.PORTAL), 2, "PORTAL = 2")

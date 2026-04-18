@@ -9,6 +9,7 @@ extends RefCounted
 const FT := "res://assets/fantasy_town/"
 const SURVIVAL := "res://assets/survival/"
 const PLATFORMER := "res://assets/platformer/"
+const PORTAL_RING_SCENE := "res://scenes/world/rotating_portal.tscn"
 
 
 ## Decorator placed around an *overworld* mine entrance (topside).
@@ -96,6 +97,23 @@ static func build_mine_spawn_chamber() -> HexDecorator:
 	lantern_r.collision_layer = 4
 
 	deco.props = [ladder, campfire, barrel, chest, lantern_l, lantern_r]
+	return deco
+
+
+## Spinning portal ring decoration. `render_layers` controls which
+## camera sees it (overworld portals = bit 1=2, portal-realm return
+## portals = bit 3=8). The mesh hovers slightly above the cell so the
+## ring sits visibly on top of the base hex.
+static func build_portal_ring(render_layers: int, light_cull_mask: int) -> HexDecorator:
+	var deco: HexDecorator = HexDecorator.new()
+	deco.display_name = "Portal"
+	var ring: HexDecorationProp = _prop(PORTAL_RING_SCENE, Vector3(0.0, 0.25, 0.0), 0.0, 0.6)
+	ring.render_layers = render_layers
+	ring.light_color = Color(0.7, 0.45, 1.0)
+	ring.light_energy = 2.0
+	ring.light_range = 4.0
+	ring.light_cull_mask = light_cull_mask
+	deco.props = [ring]
 	return deco
 
 

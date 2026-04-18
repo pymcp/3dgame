@@ -23,6 +23,10 @@ const MAX_JUMPS: int = 2
 var model: Node3D = null
 var anim_player: AnimationPlayer = null
 
+## Which `HexWorld` the player is currently in. Drives camera cull
+## masks, render layers, streaming dispatch, and transitions.
+enum WorldState { OVERWORLD = 0, MINE = 1, PORTAL = 2 }
+var world_state: int = WorldState.OVERWORLD
 var is_underground: bool = false
 var _current_anim: String = "idle"
 var _mining_active: bool = false
@@ -36,6 +40,14 @@ var _held_tool_id: StringName = &""
 var _held_tool_node: Node3D = null
 ## Back-reference so `stop_mine_anim` can restore the equipped weapon.
 var equipment: PlayerEquipment = null
+
+## Last grounded world position — used by the portal realm fall-respawn.
+## Updated every frame the player is on the floor AND in portal realm.
+var _last_safe_position: Vector3 = Vector3.ZERO
+## Y threshold below which a portal-realm fall triggers respawn.
+## FLOOR_MIN_LAYER(-3) * LAYER_HEIGHT(0.2) = -0.6; we give a generous
+## margin below that so jumping off a low island doesn't insta-respawn.
+const PORTAL_FALL_RESPAWN_Y: float = -2.0
 
 # Isometric direction rotation: 45 degrees to align WASD with isometric axes
 const ISO_ROTATION: float = -PI / 4.0
@@ -196,6 +208,15 @@ func _physics_process(delta: float) -> void:
 
 	move_and_slide()
 
+	# Portal realm: track last safe position and respawn on void fall.
+	if world_state == WorldState.PORTAL:
+		if is_on_floor():
+			_last_safe_position = global_position
+		elif global_position.y < PORTAL_FALL_RESPAWN_Y and _last_safe_position != Vector3.ZERO:
+			global_position = _last_safe_position
+			velocity = Vector3.ZERO
+			_jumps_remaining = MAX_JUMPS
+
 
 func _play_anim(anim_name: String) -> void:
 	if _current_anim == anim_name:
@@ -260,6 +281,15 @@ func _on_mine_anim_finished(_anim_name: StringName) -> void:
 ## render this player.
 func apply_render_layers(layers_bitmask: int) -> void:
 	_apply_render_layers_recursive(self, layers_bitmask)
+
+
+## Set the player's active world. Keeps the legacy `is_underground`
+## flag in sync (true iff state == MINE) so existing checks keep
+## working. The transition controller still does the
+## camera/collision/render-layer swap separately.
+func set_world_state(state: int) -> void:
+	world_state = state
+	is_underground = state == WorldState.MINE
 
 
 func _apply_render_layers_recursive(node: Node, layers_bitmask: int) -> void:
@@ -394,7 +424,12 @@ func set_held_tool(tool_id_or_path: Variant) -> void:
 	mi.scale = Vector3(1.3, 1.3, 1.3)
 	# Ensure the tool renders on the same layers the rest of the
 	# character model uses (set by apply_render_layers).
-	mi.layers = 2 if not is_underground else 4
+	mi.layers = 2
+	match world_state:
+		WorldState.MINE:
+			mi.layers = 4
+		WorldState.PORTAL:
+			mi.layers = 8
 	model.add_child(mi)
 	_held_tool_node = mi
 

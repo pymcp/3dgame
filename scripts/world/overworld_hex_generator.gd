@@ -52,6 +52,8 @@ var _cave_noise: FastNoiseLite
 var _ore_iron_noise: FastNoiseLite
 var _ore_gold_noise: FastNoiseLite
 var _ore_crystal_noise: FastNoiseLite
+## Sparse portal placement noise.
+var _portal_noise: FastNoiseLite
 
 var _landmasses: Array[LandmassShape] = []
 ## Set after the first `generate_chunk` call (when we first learn the
@@ -61,6 +63,8 @@ var _landmasses_initialized: bool = false
 # Cached spiral-search result for the guaranteed mine entrance.
 var _cached_anchor: Vector2i = Vector2i(4, 4)
 var _anchor_resolved: bool = false
+var _cached_portal_anchor: Vector2i = Vector2i(-4, -4)
+var _portal_anchor_resolved: bool = false
 
 # Cached palette indices (resolved on first generate_chunk call).
 var _idx_grass: int = -1
@@ -78,6 +82,7 @@ var _ov_mine_entrance: int = -1
 var _ov_ore_iron: int = -1
 var _ov_ore_gold: int = -1
 var _ov_ore_crystal: int = -1
+var _ov_portal: int = -1
 var _indices_resolved: bool = false
 
 
@@ -95,6 +100,7 @@ func _init(world_seed: int = 0) -> void:
 	_ore_iron_noise = _make_noise(0.10, 2, 911)
 	_ore_gold_noise = _make_noise(0.09, 2, 1013)
 	_ore_crystal_noise = _make_noise(0.08, 2, 1117)
+	_portal_noise = _make_noise(0.04, 2, 1223)
 
 
 # --- API ----------------------------------------------------------------
@@ -132,8 +138,12 @@ func land_factor(q: int, r: int) -> float:
 ## Compute the surface hex layer at (q, r). Land columns sit in
 ## [SEA_LEVEL, SURFACE_MAX_LAYER]; ocean columns return a seabed
 ## layer in [SEABED_MIN, SEABED_MAX].
-func surface_layer_at(q: int, r: int) -> int:
-	var lf: float = land_factor(q, r)
+##
+## `cached_lf` lets callers pass an already-computed `land_factor`
+## value to avoid a redundant landmass scan. Pass `INF` (the default)
+## to compute it inline.
+func surface_layer_at(q: int, r: int, cached_lf: float = INF) -> int:
+	var lf: float = cached_lf if cached_lf != INF else land_factor(q, r)
 	if lf <= 0.0:
 		return _seabed_layer_at(q, r, lf)
 
@@ -160,7 +170,7 @@ func surface_layer_at(q: int, r: int) -> int:
 	# Rivers: ridge noise carves thin meandering lines across the
 	# land. Only carve on land columns that currently sit above sea
 	# level (don't deepen an existing lake bed).
-	if is_river_at(q, r) and surface_f >= float(SEA_LEVEL):
+	if is_river_at(q, r, lf) and surface_f >= float(SEA_LEVEL):
 		return SEA_LEVEL - 1
 
 	return clampi(roundi(surface_f), SURFACE_MIN_LAYER, SURFACE_MAX_LAYER)
@@ -182,9 +192,12 @@ func cliff_step_at(q: int, r: int) -> int:
 ## |noise| < epsilon, which naturally produces curvy single-hex-wide
 ## paths. Connectivity to lakes / coasts is approximate — some rivers
 ## dead-end, which is accepted as a cosmetic trade-off.
+##
+## Pass `cached_lf` to skip the internal land-check landmass scan.
 const RIVER_THRESHOLD: float = 0.04
-func is_river_at(q: int, r: int) -> bool:
-	if not is_land(q, r):
+func is_river_at(q: int, r: int, cached_lf: float = INF) -> bool:
+	var lf: float = cached_lf if cached_lf != INF else land_factor(q, r)
+	if lf <= 0.0:
 		return false
 	var v: float = _river_noise.get_noise_2d(float(q), float(r))
 	return absf(v) < RIVER_THRESHOLD
@@ -239,6 +252,7 @@ func _ensure_indices(palette: TilePalette) -> void:
 	_ov_ore_iron = palette.overlay_index(&"ore_iron")
 	_ov_ore_gold = palette.overlay_index(&"ore_gold")
 	_ov_ore_crystal = palette.overlay_index(&"ore_crystal")
+	_ov_portal = palette.overlay_index(&"portal")
 
 
 func _fill_column(
@@ -247,7 +261,7 @@ func _fill_column(
 ) -> void:
 	var lf: float = land_factor(q, r)
 	var is_ocean: bool = lf <= 0.0
-	var surface_layer: int = surface_layer_at(q, r)
+	var surface_layer: int = surface_layer_at(q, r, lf)
 	var surface_base: int = _choose_surface_base(q, r, surface_layer, lf)
 
 	for ll: int in chunk.size_layer:
@@ -416,12 +430,27 @@ func _maybe_place_surface_overlay(
 	if surface_base == _idx_stone and mine_val > 0.55:
 		surface_cell.overlay_id = _ov_mine_entrance
 
+	# Portals — rare, allowed on any walkable surface base. Don't
+	# overwrite a mine entrance.
+	if _ov_portal >= 0 and surface_cell.overlay_id < 0:
+		var portal_val: float = _portal_noise.get_noise_2d(float(q), float(r))
+		if portal_val > 0.65 and surface_base != _idx_water:
+			surface_cell.overlay_id = _ov_portal
+
 	# Guaranteed spawn-area mine entrance at the nearest valid land
 	# column to (4, 4) (resolved once, cached).
 	var anchor: Vector2i = _mine_entrance_anchor()
 	if q == anchor.x and r == anchor.y:
 		surface_cell.base_id = _idx_stone
 		surface_cell.overlay_id = _ov_mine_entrance
+
+	# Guaranteed spawn-area portal at the nearest valid land column
+	# to (-4, -4) (opposite corner from the mine, so they don't
+	# collide spatially).
+	var portal_anchor: Vector2i = _portal_anchor()
+	if _ov_portal >= 0 and q == portal_anchor.x and r == portal_anchor.y:
+		surface_cell.base_id = _idx_stone
+		surface_cell.overlay_id = _ov_portal
 
 
 func _mine_entrance_anchor() -> Vector2i:
@@ -458,6 +487,34 @@ func _is_valid_anchor(q: int, r: int) -> bool:
 	if not is_land(q, r):
 		return false
 	return surface_layer_at(q, r) >= SEA_LEVEL + 1
+
+
+## Spiral from (-4, -4) for the guaranteed spawn-area portal. Same
+## validity rule as the mine anchor (land column above sea level).
+func _portal_anchor() -> Vector2i:
+	if _portal_anchor_resolved:
+		return _cached_portal_anchor
+	var origin: Vector2i = Vector2i(-4, -4)
+	var max_ring: int = 40
+	for ring: int in range(0, max_ring + 1):
+		if ring == 0:
+			if _is_valid_anchor(origin.x, origin.y):
+				_cached_portal_anchor = origin
+				_portal_anchor_resolved = true
+				return _cached_portal_anchor
+			continue
+		for dq: int in range(-ring, ring + 1):
+			for dr: int in range(-ring, ring + 1):
+				if HexGrid.axial_distance(Vector2i(0, 0), Vector2i(dq, dr)) != ring:
+					continue
+				var q: int = origin.x + dq
+				var r: int = origin.y + dr
+				if _is_valid_anchor(q, r):
+					_cached_portal_anchor = Vector2i(q, r)
+					_portal_anchor_resolved = true
+					return _cached_portal_anchor
+	_portal_anchor_resolved = true
+	return _cached_portal_anchor
 
 
 func _seabed_layer_at(q: int, r: int, land_f: float) -> int:

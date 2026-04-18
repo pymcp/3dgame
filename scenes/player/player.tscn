@@ -14,3 +14,14 @@ script = ExtResource("1_player")
 [node name="CollisionShape3D" type="CollisionShape3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.15, 0)
 shape = SubResource("CapsuleShape3D_player")
+
+[node name="AuraLight" type="OmniLight3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9, 0)
+light_color = Color(1, 0.92, 0.78, 1)
+light_energy = 0.9
+light_indirect_energy = 0.0
+light_specular = 0.2
+light_cull_mask = 13
+shadow_enabled = false
+omni_range = 4.5
+omni_attenuation = 1.5

@@ -57,6 +57,8 @@ func _seed_defs() -> void:
 	_add(_make(&"iron_ore", "Iron Ore", ItemDef.CAT_MATERIAL, "Rough iron ore, ready for smelting."))
 	_add(_make(&"gold_ore", "Gold Ore", ItemDef.CAT_MATERIAL, "Gleaming chunks of gold ore."))
 	_add(_make(&"crystal", "Crystal", ItemDef.CAT_MATERIAL, "A shimmering raw crystal."))
+	_add(_make(&"amethyst", "Amethyst", ItemDef.CAT_MATERIAL, "A violet crystal humming with portal energy."))
+	_add(_make(&"portal_shard", "Portal Shard", ItemDef.CAT_MATERIAL, "A jagged shard ripped from a collapsing portal."))
 
 	# --- weapons (combat — no effect in v1, reserved) ---
 	_add(_make_weapon(&"sword_basic", "Basic Sword", SURVIVAL + "tool-axe.glb", 2.0,

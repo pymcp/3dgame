@@ -34,6 +34,10 @@ extends Resource
 ## Non-visual marker used by gameplay systems (e.g. mine entrance,
 ## ladder). Decoupling from `id` lets us rename freely.
 @export var marker: StringName = &""
+## When false, the chunk renderer skips the colormap material_override so
+## the mesh keeps its embedded GLB material (used for Kenney path tiles
+## that carry their own texture).
+@export var use_colormap: bool = true
 
 
 func allowed_on_base(base_id: StringName) -> bool:

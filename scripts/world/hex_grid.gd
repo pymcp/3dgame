@@ -53,3 +53,27 @@ static func get_neighbors(q: int, r: int) -> Array[Vector2i]:
 static func axial_distance(a: Vector2i, b: Vector2i) -> int:
 	var diff: Vector2i = a - b
 	return (absi(diff.x) + absi(diff.x + diff.y) + absi(diff.y)) / 2
+
+
+## Draw a straight hex line from `a` to `b` (inclusive) using cube
+## coordinate interpolation. Returns an ordered list of all hexes
+## along the line.
+static func hex_line(a: Vector2i, b: Vector2i) -> Array[Vector2i]:
+	var dist: int = axial_distance(a, b)
+	if dist == 0:
+		return [a]
+	var results: Array[Vector2i] = []
+	# Convert axial→cube for lerp.
+	var aq: float = float(a.x)
+	var ar: float = float(a.y)
+	var a_s: float = -aq - ar
+	var bq: float = float(b.x)
+	var br: float = float(b.y)
+	var b_s: float = -bq - br
+	for i: int in range(0, dist + 1):
+		var t: float = float(i) / float(dist)
+		var cq: float = aq + (bq - aq) * t
+		var cr: float = ar + (br - ar) * t
+		# Round cube coords back to axial.
+		results.append(axial_round(cq, cr))
+	return results

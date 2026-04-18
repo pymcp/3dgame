@@ -37,8 +37,9 @@ static func build_overworld() -> TilePalette:
 		_overlay_ore(&"ore_gold", "Gold Deposit", HEX + "stone-rocks.glb", Color(1.0, 0.85, 0.25), 2.0, ["gold_ore"]),
 		_overlay_ore(&"ore_crystal", "Crystal Deposit", HEX + "stone-rocks.glb", Color(0.55, 0.75, 1.0), 2.5, ["crystal"]),
 		_overlay_mine_entrance(),
+		_overlay_portal_overworld(),
 		_overlay_workbench(),
-		# --- road overlays (auto-connected by HexRoadResolver) ---
+		# --- road overlays (thin path strips, auto-connected by HexRoadResolver) ---
 		_overlay_road(&"road_end", "Road End", HEX + "path-end.glb"),
 		_overlay_road(&"road_straight", "Road Straight", HEX + "path-straight.glb"),
 		_overlay_road(&"road_corner_sharp", "Road Corner Sharp", HEX + "path-corner-sharp.glb"),
@@ -83,6 +84,30 @@ static func build_mine() -> TilePalette:
 		_overlay_rocks_mine(),
 		_overlay_ladder_up(),
 		_overlay_workbench(),
+	]
+	return pal
+
+
+# --- portal realm --------------------------------------------------------
+
+static func build_portal_realm() -> TilePalette:
+	var pal: TilePalette = TilePalette.new()
+
+	var portal_stone: TileKind = _base(&"portal_stone", "Portal Stone", HEX + "stone.glb", 1.5, ["stone"])
+	portal_stone.tint = Color(0.35, 0.20, 0.55)   # deep amethyst
+
+	var portal_dirt: TileKind = _base(&"portal_dirt", "Portal Soil", HEX + "dirt.glb", 0.8, ["dirt_clod"])
+	portal_dirt.tint = Color(0.30, 0.18, 0.45)
+
+	var portal_bedrock: TileKind = _base(&"portal_bedrock", "Portal Bedrock", HEX + "stone.glb", 999.0, [])
+	portal_bedrock.tint = Color(0.20, 0.10, 0.30)
+	portal_bedrock.unbreakable = true
+
+	pal.bases = [portal_stone, portal_dirt, portal_bedrock]
+
+	pal.overlays = [
+		_overlay_ore(&"ore_amethyst", "Amethyst Vein", HEX + "stone-rocks.glb", Color(0.65, 0.35, 0.95), 2.0, ["amethyst"]),
+		_overlay_portal_return(),
 	]
 	return pal
 
@@ -192,10 +217,47 @@ static func _overlay_road(id: StringName, display: String, mesh_path: String) ->
 	ok.id = id
 	ok.display_name = display
 	ok.mesh = MeshLoader.load_glb(mesh_path)
-	ok.y_offset = 0.01
+	ok.y_offset = 0.20
 	ok.hardness = 0.5
 	ok.blocks_movement = false
 	ok.drops = PackedStringArray(["stone"])
 	ok.allowed_on_bases = [&"grass", &"dirt", &"sand", &"stone"]
 	ok.marker = &"road"
+	ok.use_colormap = false
+	return ok
+
+
+static func _overlay_portal_overworld() -> OverlayKind:
+	## Rare overworld portal — links to the portal realm. The visible
+	## spinning ring is added by main.gd via HexDecoratorNode whenever
+	## a `&"portal"` cell is placed; this overlay is a transparent
+	## marker (mesh still loaded for the chunk MMI but the spin scene
+	## sits on top of it).
+	var ok: OverlayKind = OverlayKind.new()
+	ok.id = &"portal"
+	ok.display_name = "Portal"
+	ok.mesh = MeshLoader.load_glb("res://assets/portals/portal-ring.glb")
+	ok.tint = Color(0.7, 0.45, 1.0)
+	ok.hardness = 999.0   # not directly mineable — interaction enters the portal
+	ok.blocks_movement = true
+	ok.marker = &"portal"
+	ok.allowed_on_bases = [&"stone", &"dirt", &"grass", &"sand"]
+	ok.use_colormap = false
+	return ok
+
+
+static func _overlay_portal_return() -> OverlayKind:
+	## Paired return portal placed in the portal realm. Identical to
+	## the overworld portal except the marker — drives the exit
+	## transition back to the linked overworld coord.
+	var ok: OverlayKind = OverlayKind.new()
+	ok.id = &"portal_return"
+	ok.display_name = "Return Portal"
+	ok.mesh = MeshLoader.load_glb("res://assets/portals/portal-ring.glb")
+	ok.tint = Color(0.7, 0.45, 1.0)
+	ok.hardness = 999.0
+	ok.blocks_movement = true
+	ok.marker = &"portal_return"
+	ok.allowed_on_bases = [&"portal_stone", &"portal_dirt"]
+	ok.use_colormap = false
 	return ok
